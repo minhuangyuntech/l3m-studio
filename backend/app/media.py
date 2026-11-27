@@ -21,6 +21,7 @@ from .config import APP_HOME, ENGINES_DIR, config_manager
 from .engine import engine_manager
 from .hardware import get_hardware_info
 from .models import scan_local_models
+from .video_backends import interrupt_comfyui, probe_comfyui, run_comfyui_video, run_jimeng_video
 
 OUTPUTS_DIR = APP_HOME / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
@@ -156,6 +157,7 @@ class MediaManager:
         }
         self._active_proc: Optional[asyncio.subprocess.Process] = None
         self._job_procs: Dict[str, asyncio.subprocess.Process] = {}
+        self._job_comfy_prompts: Dict[str, tuple[str, str]] = {}
         self._cancelled_jobs: set[str] = set()
 
     def _force_kill_proc(self, proc: Optional[asyncio.subprocess.Process]) -> None:
@@ -186,6 +188,12 @@ class MediaManager:
         if self._active_proc and (proc is None or self._active_proc is proc):
             self._force_kill_proc(self._active_proc)
             self._active_proc = None
+        comfy_info = self._job_comfy_prompts.pop(job_id, None)
+        if comfy_info:
+            try:
+                asyncio.create_task(interrupt_comfyui(comfy_info[0], comfy_info[1]))
+            except Exception:
+                pass
         job = self.jobs.get(job_id)
         if job and job.get("status") == "running":
             job["status"] = "cancelled"
@@ -203,6 +211,19 @@ class MediaManager:
             self._force_kill_proc(self._active_proc)
             self._active_proc = None
         return {"cancelled": True, "job_ids": cancelled_ids}
+
+    async def get_media_models_async(self) -> Dict[str, Any]:
+        data = self.get_media_models()
+        comfy_status = await probe_comfyui()
+        data["comfyui_status"] = comfy_status
+        data["engines"]["comfyui_url"] = comfy_status.get("url") or config_manager.config.comfyui_url
+        data["engines"]["video_backend"] = config_manager.config.video_backend
+        data["engines"]["jimeng_configured"] = bool(config_manager.config.jimeng_api_key.strip())
+        data["engines"]["jimeng_api_base"] = config_manager.config.jimeng_api_base
+        data["engines"]["jimeng_model"] = config_manager.config.jimeng_model
+        data["engines"]["jimeng_generate_audio"] = config_manager.config.jimeng_generate_audio
+        data["engines"]["jimeng_watermark"] = config_manager.config.jimeng_watermark
+        return data
 
     def get_media_models(self) -> Dict[str, Any]:
         all_models = scan_local_models()
@@ -564,6 +585,22 @@ class MediaManager:
     async def _run_video_job(self, job: Dict[str, Any], params: Dict[str, Any]) -> None:
         t0 = time.monotonic()
         try:
+            backend = str(params.get("video_backend") or config_manager.config.video_backend or "comfyui").lower()
+
+            if backend == "jimeng":
+                final_out, model_meta = await run_jimeng_video(
+                    job=job,
+                    params=params,
+                    videos_dir=VIDEOS_DIR,
+                    is_cancelled=lambda: job["id"] in self._cancelled_jobs,
+                )
+                self._register_output(job, model_meta, final_out, "video", params, time.monotonic() - t0)
+                job["status"] = "completed"
+                job["progress"] = 100
+                job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
+                job["message"] = f"即夢 API 影片生成完成（耗時 {job['elapsed_seconds']}s）"
+                return
+
             if params.get("auto_unload_llm", True) and (
                 engine_manager.status in ("running", "starting")
                 or engine_manager.find_external_llama_servers()
@@ -571,6 +608,25 @@ class MediaManager:
                 job["message"] = "正在自動停止背景 LLM 釋放顯卡 VRAM..."
                 await engine_manager.stop_all_llama_servers()
                 await asyncio.sleep(1.0)
+
+            if backend == "comfyui":
+                ff_path = _save_base64_upload(params["first_frame_data_url"], "first") if params.get("first_frame_data_url") else None
+                lf_path = _save_base64_upload(params["last_frame_data_url"], "last") if params.get("last_frame_data_url") else None
+                final_out, model_meta = await run_comfyui_video(
+                    job=job,
+                    params=params,
+                    videos_dir=VIDEOS_DIR,
+                    first_frame_path=ff_path,
+                    last_frame_path=lf_path,
+                    is_cancelled=lambda: job["id"] in self._cancelled_jobs,
+                    on_prompt_submitted=lambda u, pid: self._job_comfy_prompts.__setitem__(job["id"], (u, pid)),
+                )
+                self._register_output(job, model_meta, final_out, "video", params, time.monotonic() - t0)
+                job["status"] = "completed"
+                job["progress"] = 100
+                job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
+                job["message"] = f"ComfyUI 影片生成完成（耗時 {job['elapsed_seconds']}s）"
+                return
 
             all_models = scan_local_models()
             model = next((m for m in all_models if m["id"] == params.get("model_id")), None)
@@ -709,7 +765,7 @@ class MediaManager:
             job["progress"] = 100
             job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
             job["message"] = f"影片生成完成（耗時 {job['elapsed_seconds']}s）"
-        except JobCancelledError:
+        except (JobCancelledError, asyncio.CancelledError):
             job["status"] = "cancelled"
             job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
             job["message"] = f"已強制取消影片作業（已執行 {job['elapsed_seconds']}s）"
@@ -726,6 +782,7 @@ class MediaManager:
                 job["message"] = f"生成失敗：{exc}"
         finally:
             self._job_procs.pop(job["id"], None)
+            self._job_comfy_prompts.pop(job["id"], None)
             self._cancelled_jobs.discard(job["id"])
 
     def start_lipsync_generation(self, params: Dict[str, Any]) -> Dict[str, Any]:

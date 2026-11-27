@@ -194,6 +194,12 @@ export interface AppSettings {
   sd_cli_path: string;
   comfyui_url: string;
   custom_image_api: string;
+  video_backend: 'comfyui' | 'jimeng' | 'sd_cli';
+  jimeng_api_base: string;
+  jimeng_api_key: string;
+  jimeng_model: string;
+  jimeng_generate_audio: boolean;
+  jimeng_watermark: boolean;
   theme: 'dark' | 'light';
 }
 
@@ -227,11 +233,45 @@ export interface MediaJob {
   error: string;
 }
 
+export interface ComfyUIPreset {
+  id: string;
+  name: string;
+  description: string;
+  default_steps: number;
+  default_duration: number;
+  supports_first_frame: boolean;
+  supports_last_frame: boolean;
+  supports_audio: boolean;
+  badge: string;
+}
+
+export interface ComfyUIStatus {
+  online: boolean;
+  url: string;
+  version: string;
+  gpu_name: string;
+  error: string;
+  unets: string[];
+  clips: string[];
+  vaes: string[];
+  upscalers: string[];
+  loras: string[];
+  detected: {
+    has_ltx25?: boolean;
+    has_minimax_h3?: boolean;
+    has_minimax_turbo_lora?: boolean;
+    ltx25?: Record<string, string>;
+    minimax_h3?: Record<string, string>;
+  };
+  presets: ComfyUIPreset[];
+}
+
 export interface MediaModelsResponse {
   image_models: (LocalModel & { components?: Record<string, string> })[];
   video_models: (LocalModel & { components?: Record<string, string> })[];
   lipsync_models: LocalModel[];
   loras: Array<{ name: string; filename: string; path: string }>;
+  comfyui_status?: ComfyUIStatus;
   engines: {
     sd_cli_installed: boolean;
     sd_cli_path: string;
@@ -245,6 +285,12 @@ export interface MediaModelsResponse {
     };
     comfyui_url: string;
     custom_image_api: string;
+    video_backend?: 'comfyui' | 'jimeng' | 'sd_cli';
+    jimeng_configured?: boolean;
+    jimeng_api_base?: string;
+    jimeng_model?: string;
+    jimeng_generate_audio?: boolean;
+    jimeng_watermark?: boolean;
     lipsync_env_ready: boolean;
     lipsync_env_path: string;
     llm_running?: boolean;

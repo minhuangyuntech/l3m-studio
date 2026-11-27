@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import shutil
+import socket
 from pathlib import Path
 from typing import Any, List, Optional
 from pydantic import BaseModel, Field
@@ -33,6 +34,23 @@ CONFIG_PATH = APP_HOME / "config.json"
 ENGINES_DIR = APP_HOME / "engines"
 CHATS_DIR = APP_HOME / "chats"
 DEFAULT_MODELS_DIR = APP_HOME / "models"
+
+
+def _port_open(host: str, port: int, timeout: float = 0.25) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _discover_comfyui_url() -> str:
+    # ComfyUI Desktop defaults to 127.0.0.1:8000; portable/CLI defaults to 127.0.0.1:8188
+    if _port_open("127.0.0.1", 8000):
+        return "http://127.0.0.1:8000"
+    if _port_open("127.0.0.1", 8188):
+        return "http://127.0.0.1:8188"
+    return "http://127.0.0.1:8000"
 
 
 def _discover_default_model_dirs() -> List[str]:
@@ -99,8 +117,14 @@ class AppConfig(BaseModel):
     external_api_key: str = ""
     external_api_model: str = ""
     sd_cli_path: str = ""
-    comfyui_url: str = "http://127.0.0.1:8188"
+    comfyui_url: str = Field(default_factory=_discover_comfyui_url)
     custom_image_api: str = ""
+    video_backend: str = "comfyui"  # comfyui | jimeng | sd_cli
+    jimeng_api_base: str = "https://ark.cn-beijing.volces.com/api/v3"
+    jimeng_api_key: str = ""
+    jimeng_model: str = "doubao-seedance-1-5-pro-251215"
+    jimeng_generate_audio: bool = True
+    jimeng_watermark: bool = False
     theme: str = "dark"
 
 
@@ -141,6 +165,11 @@ class ConfigManager:
             discovered = _discover_llama_server()
             if discovered:
                 cfg.llama_server_path = discovered
+
+        # Auto-migrate old default ComfyUI port 8188 -> 8000 if 8000 is running and 8188 is not
+        if cfg.comfyui_url.rstrip("/") == "http://127.0.0.1:8188":
+            if not _port_open("127.0.0.1", 8188) and _port_open("127.0.0.1", 8000):
+                cfg.comfyui_url = "http://127.0.0.1:8000"
 
         self._save(cfg)
         return cfg

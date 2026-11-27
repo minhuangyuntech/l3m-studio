@@ -5,6 +5,7 @@ import type {
   ChatAttachment,
   ChatDetail,
   ChatSummary,
+  ComfyUIStatus,
   DownloadTask,
   EngineInfo,
   EngineStatus,
@@ -155,6 +156,13 @@ export const api = {
 
   // Media Studio
   getMediaModels: () => req<MediaModelsResponse>('/api/media/models'),
+  getComfyuiStatus: (force = false) =>
+    req<ComfyUIStatus>(`/api/media/comfyui/status${force ? '?force=true' : ''}`),
+  testComfyui: (url?: string) =>
+    req<ComfyUIStatus>('/api/media/comfyui/test', {
+      method: 'POST',
+      body: JSON.stringify({ url: url || '' }),
+    }),
   getMediaGallery: (kind?: string) =>
     req<{ items: MediaGalleryItem[] }>(
       kind ? `/api/media/gallery?kind=${encodeURIComponent(kind)}` : '/api/media/gallery',

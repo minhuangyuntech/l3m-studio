@@ -16,6 +16,7 @@ from .config import config_manager
 from .engine import engine_manager
 from .hardware import get_hardware_info, get_realtime_metrics
 from .media import IMAGES_DIR, LIPSYNC_DIR, VIDEOS_DIR, media_manager
+from .video_backends import probe_comfyui
 from .models import (
     download_manager,
     get_recommended_models,
@@ -319,7 +320,18 @@ async def stream_chat(chat_id: str, req: ChatStreamReq) -> StreamingResponse:
 
 @router.get("/media/models")
 async def media_models() -> Dict[str, Any]:
-    return media_manager.get_media_models()
+    return await media_manager.get_media_models_async()
+
+
+@router.get("/media/comfyui/status")
+async def media_comfyui_status(force: bool = Query(default=False)) -> Dict[str, Any]:
+    return await probe_comfyui(force=force)
+
+
+@router.post("/media/comfyui/test")
+async def media_comfyui_test(body: Dict[str, Any]) -> Dict[str, Any]:
+    url = str(body.get("url") or "").strip() or None
+    return await probe_comfyui(base_url=url, force=True, timeout=4.0)
 
 
 @router.get("/media/gallery")

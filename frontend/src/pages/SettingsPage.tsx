@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { Check, FolderOpen, Plus, Save, Trash2 } from 'lucide-react';
+import { Check, Cloud, FolderOpen, Plus, RefreshCw, Save, Trash2, Workflow } from 'lucide-react';
 import { api } from '../api/client';
-import type { AppSettings } from '../types';
+import type { AppSettings, ComfyUIStatus } from '../types';
 
 interface SettingsPageProps {
   settings: AppSettings | null;
@@ -13,6 +13,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
   const [newDir, setNewDir] = useState('');
   const [saving, setSaving] = useState(false);
   const [savedToast, setSavedToast] = useState(false);
+  const [testingComfy, setTestingComfy] = useState(false);
+  const [comfyResult, setComfyResult] = useState<ComfyUIStatus | null>(null);
 
   useEffect(() => {
     if (settings) setForm(settings);
@@ -240,23 +242,62 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
 
       {/* Media & ComfyUI Engines */}
       <div className="studio-card p-5 space-y-4">
-        <div className="font-bold text-sm text-slateink">畫圖與影片引擎（stable-diffusion.cpp / ComfyUI）</div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="font-bold text-sm text-slateink flex items-center gap-2">
+            <Workflow className="w-4 h-4 text-cyan-400" />
+            畫圖與影片引擎（ComfyUI / stable-diffusion.cpp）
+          </div>
+          <button
+            type="button"
+            disabled={testingComfy}
+            onClick={async () => {
+              setTestingComfy(true);
+              try {
+                const res = await api.testComfyui(form.comfyui_url);
+                setComfyResult(res);
+              } finally {
+                setTestingComfy(false);
+              }
+            }}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25 text-xs font-semibold transition"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${testingComfy ? 'animate-spin' : ''}`} />
+            {testingComfy ? '測試中...' : '測試 ComfyUI 連線'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">
+              ComfyUI 伺服器網址（桌面版預設 :8000 / 攜帶版 :8188）
+            </label>
+            <input
+              value={form.comfyui_url || ''}
+              onChange={(e) => setForm({ ...form, comfyui_url: e.target.value })}
+              placeholder="http://127.0.0.1:8000"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">預設影片生成後台</label>
+            <select
+              value={form.video_backend || 'comfyui'}
+              onChange={(e) =>
+                setForm({ ...form, video_backend: e.target.value as 'comfyui' | 'jimeng' | 'sd_cli' })
+              }
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-semibold"
+            >
+              <option value="comfyui">ComfyUI 本機後台（推薦 · INT8 高畫質）</option>
+              <option value="jimeng">即夢 API（火山方舟 Seedance 雲端）</option>
+              <option value="sd_cli">本機 sd-cli（輕量 GGUF 備用）</option>
+            </select>
+          </div>
           <div>
             <label className="block font-semibold text-slateink-muted mb-1">sd-cli 執行檔路徑（選填）</label>
             <input
               value={form.sd_cli_path || ''}
               onChange={(e) => setForm({ ...form, sd_cli_path: e.target.value })}
               placeholder="自動偵測或於畫圖頁一鍵安裝"
-              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
-            />
-          </div>
-          <div>
-            <label className="block font-semibold text-slateink-muted mb-1">ComfyUI 伺服器網址</label>
-            <input
-              value={form.comfyui_url || ''}
-              onChange={(e) => setForm({ ...form, comfyui_url: e.target.value })}
-              placeholder="http://127.0.0.1:8188"
               className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
             />
           </div>
@@ -269,6 +310,93 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
               className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
             />
           </div>
+        </div>
+
+        {comfyResult && (
+          <div
+            className={`rounded-xl px-3.5 py-2.5 text-xs border ${
+              comfyResult.online
+                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
+                : 'bg-rose-500/10 border-rose-500/30 text-rose-200'
+            }`}
+          >
+            {comfyResult.online ? (
+              <div className="space-y-1">
+                <div className="font-semibold">
+                  連線成功：ComfyUI v{comfyResult.version || 'OK'} · {comfyResult.gpu_name || 'GPU Ready'}（{comfyResult.url}）
+                </div>
+                <div className="text-[11px] opacity-90">
+                  已偵測影片管線：
+                  {comfyResult.detected?.has_ltx25 ? ' LTX-2.5 22B INT8 ✓' : ''}
+                  {comfyResult.detected?.has_minimax_h3 ? ' · MiniMax-H3 FL2VA INT8 ✓' : ''}
+                  {comfyResult.detected?.has_minimax_turbo_lora ? ' · MiniMax 8步 Turbo LoRA ✓' : ''}
+                </div>
+              </div>
+            ) : (
+              <div>連線失敗：{comfyResult.error || '無法連上 ComfyUI'}</div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Jimeng / Volcengine Ark Seedance Video API */}
+      <div className="studio-card p-5 space-y-4">
+        <div className="font-bold text-sm text-slateink flex items-center gap-2">
+          <Cloud className="w-4 h-4 text-violet-400" />
+          即夢 API（火山方舟 Seedance / Jimeng 影片生成設定）
+        </div>
+        <p className="text-[11px] text-slateink-muted -mt-2">
+          保留雲端呼叫即夢 / 火山方舟 Seedance API 的完整支援（亦相容第三方中轉閘道）。設定後可於「影片」頁一鍵切換為「即夢 API」。
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">API Base URL</label>
+            <input
+              value={form.jimeng_api_base || ''}
+              onChange={(e) => setForm({ ...form, jimeng_api_base: e.target.value })}
+              placeholder="https://ark.cn-beijing.volces.com/api/v3"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">API Key（Bearer Token）</label>
+            <input
+              type="password"
+              value={form.jimeng_api_key || ''}
+              onChange={(e) => setForm({ ...form, jimeng_api_key: e.target.value })}
+              placeholder="請填寫火山方舟 / 即夢 API Key"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">預設模型 / 推理接入點 ID</label>
+            <input
+              value={form.jimeng_model || ''}
+              onChange={(e) => setForm({ ...form, jimeng_model: e.target.value })}
+              placeholder="doubao-seedance-1-5-pro-251215"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-5 text-xs pt-1">
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={Boolean(form.jimeng_generate_audio)}
+              onChange={(e) => setForm({ ...form, jimeng_generate_audio: e.target.checked })}
+              className="accent-violet-400"
+            />
+            <span>預設同步生成影片音訊 (generate_audio)</span>
+          </label>
+          <label className="inline-flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={!form.jimeng_watermark}
+              onChange={(e) => setForm({ ...form, jimeng_watermark: !e.target.checked })}
+              className="accent-violet-400"
+            />
+            <span>預設關閉官方浮水印 (watermark: false)</span>
+          </label>
         </div>
       </div>
 
