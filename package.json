@@ -1,0 +1,41 @@
+{
+  "name": "l3m-studio",
+  "version": "1.1.0",
+  "description": "L3M Studio — Cross-platform local multimodal AI workstation (Windows / macOS / Linux)",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "build:frontend": "npm --prefix frontend run build",
+    "start:desktop": "electron .",
+    "dev:desktop": "LOCMODEL_DEV=1 electron .",
+    "pack:win": "npm run build:frontend && electron-builder --win",
+    "pack:mac": "npm run build:frontend && electron-builder --mac",
+    "pack:linux": "npm run build:frontend && electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.l3m.studio",
+    "productName": "L3M Studio",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "frontend/dist/**/*",
+      "backend/main.py",
+      "backend/requirements.txt",
+      "backend/app/**/*"
+    ],
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "mac": {
+      "target": ["dmg"]
+    },
+    "linux": {
+      "target": ["AppImage", "deb"]
+    }
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  }
+}

@@ -1,0 +1,311 @@
+import React, { useEffect, useState } from 'react';
+import { Check, FolderOpen, Plus, Save, Trash2 } from 'lucide-react';
+import { api } from '../api/client';
+import type { AppSettings } from '../types';
+
+interface SettingsPageProps {
+  settings: AppSettings | null;
+  onSaved: () => void;
+}
+
+export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved }) => {
+  const [form, setForm] = useState<AppSettings | null>(settings);
+  const [newDir, setNewDir] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [savedToast, setSavedToast] = useState(false);
+
+  useEffect(() => {
+    if (settings) setForm(settings);
+  }, [settings]);
+
+  if (!form) return null;
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await api.updateSettings(form);
+      setSavedToast(true);
+      setTimeout(() => setSavedToast(false), 2000);
+      onSaved();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleAddDir = () => {
+    const clean = newDir.trim();
+    if (!clean || form.model_dirs.includes(clean)) return;
+    setForm({ ...form, model_dirs: [...form.model_dirs, clean] });
+    setNewDir('');
+  };
+
+  const handleBrowseDir = async () => {
+    if (window.locmodelDesktop?.selectDirectory) {
+      const dir = await window.locmodelDesktop.selectDirectory();
+      if (dir && !form.model_dirs.includes(dir)) {
+        setForm({ ...form, model_dirs: [...form.model_dirs, dir] });
+      }
+    }
+  };
+
+  const handleBrowseServer = async () => {
+    if (window.locmodelDesktop?.selectFile) {
+      const f = await window.locmodelDesktop.selectFile();
+      if (f) setForm({ ...form, llama_server_path: f });
+    }
+  };
+
+  return (
+    <div className="space-y-5 max-w-4xl mx-auto">
+      <div className="flex items-end justify-between">
+        <div>
+          <div className="studio-eyebrow">08 / SETTINGS</div>
+          <h1 className="text-2xl font-extrabold text-slateink mt-0.5">系統與目錄設定</h1>
+          <p className="text-xs text-slateink-muted mt-1">
+            管理本地模型資料夾、llama-server 執行檔路徑、HuggingFace 來源與第三方 API。
+          </p>
+        </div>
+
+        <button
+          onClick={handleSave}
+          disabled={saving}
+          className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-terracotta hover:bg-terracotta-dark text-white text-xs font-semibold shadow-sm transition"
+        >
+          {savedToast ? <Check className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+          {savedToast ? '已儲存設定' : saving ? '儲存中...' : '儲存設定'}
+        </button>
+      </div>
+
+      {/* Model Directories */}
+      <div className="studio-card p-5 space-y-3">
+        <div className="font-bold text-sm text-slateink">本地模型搜尋目錄</div>
+        <div className="space-y-2">
+          {form.model_dirs.map((d) => (
+            <div
+              key={d}
+              className="flex items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-paper border border-paper-border text-xs"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <FolderOpen className="w-4 h-4 text-terracotta shrink-0" />
+                <span className="font-mono truncate">{d}</span>
+                {form.primary_download_dir === d && (
+                  <span className="text-[10px] px-2 py-0.5 rounded-full bg-terracotta-soft text-terracotta-dark font-semibold shrink-0">
+                    預設下載目錄
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {form.primary_download_dir !== d && (
+                  <button
+                    onClick={() => setForm({ ...form, primary_download_dir: d })}
+                    className="text-[11px] text-sky-700 hover:underline"
+                  >
+                    設為下載目錄
+                  </button>
+                )}
+                {form.model_dirs.length > 1 && (
+                  <button
+                    onClick={() =>
+                      setForm({ ...form, model_dirs: form.model_dirs.filter((x) => x !== d) })
+                    }
+                    className="text-rose-600 hover:bg-rose-50 p-1 rounded"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="flex gap-2 pt-1">
+          <input
+            value={newDir}
+            onChange={(e) => setNewDir(e.target.value)}
+            placeholder="輸入新模型資料夾路徑（如 D:\AI-Models 或 ~/models）..."
+            className="flex-1 px-3.5 py-2 rounded-xl border border-paper-border bg-paper text-xs font-mono"
+          />
+          {window.locmodelDesktop?.isElectron && (
+            <button
+              onClick={handleBrowseDir}
+              className="px-3.5 py-2 rounded-xl border border-paper-border bg-paper-subtle text-xs font-semibold"
+            >
+              選擇資料夾
+            </button>
+          )}
+          <button
+            onClick={handleAddDir}
+            className="inline-flex items-center gap-1 px-3.5 py-2 rounded-xl bg-slateink text-white text-xs font-semibold"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            新增
+          </button>
+        </div>
+      </div>
+
+      {/* Engine & Tiering Settings */}
+      <div className="studio-card p-5 space-y-4">
+        <div className="font-bold text-sm text-slateink">推理引擎與自動分層</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div className="md:col-span-2">
+            <label className="block font-semibold text-slateink-muted mb-1">
+              llama-server 執行檔路徑
+            </label>
+            <div className="flex gap-2">
+              <input
+                value={form.llama_server_path}
+                onChange={(e) => setForm({ ...form, llama_server_path: e.target.value })}
+                className="flex-1 px-3.5 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+              />
+              {window.locmodelDesktop?.isElectron && (
+                <button
+                  onClick={handleBrowseServer}
+                  className="px-3.5 py-2 rounded-xl border border-paper-border bg-paper-subtle font-semibold"
+                >
+                  瀏覽
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">預設 API 連接埠</label>
+            <input
+              type="number"
+              value={form.api_port}
+              onChange={(e) => setForm({ ...form, api_port: Number(e.target.value) })}
+              className="w-full px-3.5 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">
+              自動分層系統保留記憶體 (GB)
+            </label>
+            <input
+              type="number"
+              step={0.5}
+              min={1}
+              max={32}
+              value={form.reserve_ram_gb}
+              onChange={(e) => setForm({ ...form, reserve_ram_gb: Number(e.target.value) })}
+              className="w-full px-3.5 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* HuggingFace & Mirror */}
+      <div className="studio-card p-5 space-y-4">
+        <div className="font-bold text-sm text-slateink">HuggingFace 下載來源</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">下載端點</label>
+            <div className="flex gap-2">
+              <input
+                value={form.hf_endpoint}
+                onChange={(e) => setForm({ ...form, hf_endpoint: e.target.value })}
+                className="flex-1 px-3.5 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+              />
+              <button
+                onClick={() =>
+                  setForm({
+                    ...form,
+                    hf_endpoint:
+                      form.hf_endpoint.includes('hf-mirror')
+                        ? 'https://huggingface.co'
+                        : 'https://hf-mirror.com',
+                  })
+                }
+                className="px-3 py-2 rounded-xl border border-paper-border bg-paper-subtle font-semibold shrink-0"
+              >
+                切換鏡像
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">
+              HF Access Token（選填，用於存取需授權模型）
+            </label>
+            <input
+              type="password"
+              value={form.hf_token}
+              onChange={(e) => setForm({ ...form, hf_token: e.target.value })}
+              placeholder="hf_..."
+              className="w-full px-3.5 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Media & ComfyUI Engines */}
+      <div className="studio-card p-5 space-y-4">
+        <div className="font-bold text-sm text-slateink">畫圖與影片引擎（stable-diffusion.cpp / ComfyUI）</div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">sd-cli 執行檔路徑（選填）</label>
+            <input
+              value={form.sd_cli_path || ''}
+              onChange={(e) => setForm({ ...form, sd_cli_path: e.target.value })}
+              placeholder="自動偵測或於畫圖頁一鍵安裝"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">ComfyUI 伺服器網址</label>
+            <input
+              value={form.comfyui_url || ''}
+              onChange={(e) => setForm({ ...form, comfyui_url: e.target.value })}
+              placeholder="http://127.0.0.1:8188"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">自訂繪圖 API（OpenAI 相容）</label>
+            <input
+              value={form.custom_image_api || ''}
+              onChange={(e) => setForm({ ...form, custom_image_api: e.target.value })}
+              placeholder="http://127.0.0.1:7860/v1"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* External API */}
+      <div className="studio-card p-5 space-y-4">
+        <div className="font-bold text-sm text-slateink">第三方 OpenAI 相容 API（選填）</div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">Base URL</label>
+            <input
+              value={form.external_api_base}
+              onChange={(e) => setForm({ ...form, external_api_base: e.target.value })}
+              placeholder="https://api.openai.com/v1"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">API Key</label>
+            <input
+              type="password"
+              value={form.external_api_key}
+              onChange={(e) => setForm({ ...form, external_api_key: e.target.value })}
+              placeholder="sk-..."
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">預設模型名稱</label>
+            <input
+              value={form.external_api_model}
+              onChange={(e) => setForm({ ...form, external_api_model: e.target.value })}
+              placeholder="gpt-4o-mini / claude-sonnet"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
