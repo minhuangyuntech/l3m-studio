@@ -109,6 +109,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   const lastFrameRef = useRef<HTMLInputElement>(null);
   const portraitRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLInputElement>(null);
+  const lastTopVideoIdRef = useRef<string>('');
 
   const measureAndSetFirstFrame = (dataUrl: string) => {
     setFirstFrame(dataUrl);
@@ -155,7 +156,14 @@ export const VideoPage: React.FC<VideoPageProps> = ({
         setModelId((prev) => (prev && m.video_models.some((x) => x.id === prev) ? prev : defaultId));
       }
       if (g.items.length > 0) {
-        setSelectedVideo((prev) => prev || g.items[0]);
+        const newest = g.items[0];
+        if (lastTopVideoIdRef.current && lastTopVideoIdRef.current !== newest.id) {
+          // Automatically focus the preview stage onto the newly finished video
+          setSelectedVideo(newest);
+        } else {
+          setSelectedVideo((prev) => prev || newest);
+        }
+        lastTopVideoIdRef.current = newest.id;
       }
     } catch (err: any) {
       setNotice(`無法載入影片模型列表：${err?.message || '請重新啟動 L3M Studio 後端服務'}`);
@@ -175,8 +183,8 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       const targetArea = 832 * 480; // ~400K pixels (optimal 480p video budget on 8GB VRAM)
       const rawW = Math.sqrt((targetArea * iw) / ih);
       const rawH = (rawW * ih) / iw;
-      const snap16 = (v: number) => Math.max(320, Math.min(960, Math.round(v / 16) * 16));
-      return [snap16(rawW), snap16(rawH)];
+      const snap32 = (v: number) => Math.max(320, Math.min(960, Math.round(v / 32) * 32));
+      return [snap32(rawW), snap32(rawH)];
     }
     const found = VIDEO_SIZES.find((s) => s.id === sizePreset) || VIDEO_SIZES[0];
     return [found.w, found.h];
