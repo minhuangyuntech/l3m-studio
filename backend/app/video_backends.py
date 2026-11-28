@@ -195,6 +195,9 @@ async def probe_comfyui(
             "VAELoader",
             "LatentUpscaleModelLoader",
             "LoraLoaderModelOnly",
+            "ModelPatchLoader",
+            "AudioEncoderLoader",
+            "WanInfiniteTalkToVideo",
             "MiniMaxH3ImageToVideo",
             "LTXVDualCFGGuider",
             "ModelSamplingAuraFlow",
@@ -219,6 +222,8 @@ async def probe_comfyui(
         vaes = _extract_combo_list(node_infos.get("VAELoader", {}), "vae_name")
         upscalers = _extract_combo_list(node_infos.get("LatentUpscaleModelLoader", {}), "model_name")
         loras = _extract_combo_list(node_infos.get("LoraLoaderModelOnly", {}), "lora_name")
+        model_patches = _extract_combo_list(node_infos.get("ModelPatchLoader", {}), "name")
+        audio_encoders = _extract_combo_list(node_infos.get("AudioEncoderLoader", {}), "audio_encoder_name")
 
         # Filter out video-only checkpoints (like ltx-2.3) from image checkpoint selector
         image_checkpoints = [c for c in checkpoints if "ltx-" not in c.lower() and "wan2" not in c.lower()]
@@ -254,6 +259,17 @@ async def probe_comfyui(
         mm_turbo_lora = _pick(loras, "minimax_h3", "turbo") or _pick(loras, "minimax", "8step")
         has_minimax = bool(mm_unet and mm_clip and mm_v_vae and mm_a_vae and "MiniMaxH3ImageToVideo" in node_infos)
 
+        # Detect InfiniteTalk + Wan2.1 Lip-Sync pipeline (native ComfyUI WanInfiniteTalkToVideo)
+        it_unet = _pick(unets, "wan2_1", "i2v") or _pick(unets, "wan2.1", "i2v") or _pick(unets, "wan", "14b")
+        it_clip = _pick(clips, "umt5_xxl") or _pick(clips, "umt5")
+        it_vae = _pick(vaes, "wan2_1_vae") or _pick(vaes, "wan_2.1_vae") or _pick(vaes, "wan", "vae")
+        it_patch = _pick(model_patches, "infinitetalk", "single") or _pick(model_patches, "infinitetalk")
+        it_audio_enc = _pick(audio_encoders, "wav2vec2") or (audio_encoders[0] if audio_encoders else "")
+        it_speed_lora = _pick(loras, "lightx2v", "14b") or _pick(loras, "lightx2v")
+        has_infinitetalk = bool(
+            it_unet and it_clip and it_vae and it_patch and it_audio_enc and "WanInfiniteTalkToVideo" in node_infos
+        )
+
         result["detected"] = {
             "has_z_image": has_z_image,
             "z_image": {
@@ -278,6 +294,15 @@ async def probe_comfyui(
                 "video_vae": mm_v_vae,
                 "audio_vae": mm_a_vae,
                 "turbo_lora": mm_turbo_lora,
+            },
+            "has_infinitetalk": has_infinitetalk,
+            "infinitetalk": {
+                "unet": it_unet,
+                "clip": it_clip,
+                "vae": it_vae,
+                "model_patch": it_patch,
+                "audio_encoder": it_audio_enc,
+                "speed_lora": it_speed_lora,
             },
         }
 
@@ -748,6 +773,143 @@ def build_minimax_h3_workflow(
     wf["17"] = {
         "class_type": "SaveVideo",
         "inputs": {"video": ["16", 0], "filename_prefix": f"video/L3M_MiniMaxH3_{int(time.time())}", "format": "auto", "codec": "auto"},
+    }
+    return wf
+
+
+def build_infinitetalk_lipsync_workflow(
+    detected: Dict[str, str],
+    portrait_name: str,
+    audio_name: str,
+    prompt: str,
+    width: int,
+    height: int,
+    duration_sec: float,
+    steps: int,
+    seed: int,
+    audio_scale: float = 1.0,
+) -> Dict[str, Any]:
+    """Official ComfyUI v0.46.0 native WanInfiniteTalkToVideo single-speaker audio lip-sync workflow."""
+    w = _snap(width, 16, 320, 1280)
+    h = _snap(height, 16, 320, 1280)
+    fps = 25.0
+    use_lora = bool(detected.get("speed_lora"))
+    effective_steps = max(4, min(30, int(steps or (6 if use_lora else 20))))
+    effective_cfg = 1.0 if use_lora else 4.0
+    effective_prompt = (
+        prompt.strip()
+        or "A person speaking naturally and expressively to the camera, natural head movement, clear lip synchronization, soft studio lighting"
+    )
+
+    # Each chunk generates 81 frames (~3.24s @ 25fps); chain up to 6 chunks (~19s) for longer audio
+    chunk_len = 81
+    num_chunks = max(1, min(6, int((max(1.0, duration_sec) + 2.6) // 3.0)))
+
+    wf: Dict[str, Any] = {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": detected["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": detected["clip"], "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": detected["vae"]}},
+        "4": {"class_type": "ModelPatchLoader", "inputs": {"name": detected["model_patch"]}},
+        "5": {"class_type": "AudioEncoderLoader", "inputs": {"audio_encoder_name": detected["audio_encoder"]}},
+        "6": {"class_type": "LoadImage", "inputs": {"image": portrait_name}},
+        "7": {"class_type": "LoadAudio", "inputs": {"audio": audio_name}},
+        "8": {"class_type": "AudioEncoderEncode", "inputs": {"audio_encoder": ["5", 0], "audio": ["7", 0]}},
+        "9": {"class_type": "CLIPTextEncode", "inputs": {"text": effective_prompt, "clip": ["2", 0]}},
+        "10": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["9", 0]}},
+        "11": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+    }
+
+    model_ref: Any = ["1", 0]
+    if use_lora:
+        wf["12"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"model": ["1", 0], "lora_name": detected["speed_lora"], "strength_model": 1.0},
+        }
+        model_ref = ["12", 0]
+
+    decoded_refs: List[Any] = []
+    next_id = 20
+    prev_decode_ref: Optional[Any] = None
+
+    for c_idx in range(num_chunks):
+        inf_id = str(next_id)
+        guider_id = str(next_id + 1)
+        sched_id = str(next_id + 2)
+        noise_id = str(next_id + 3)
+        samp_id = str(next_id + 4)
+        dec_id = str(next_id + 5)
+        next_id += 6
+
+        inf_inputs: Dict[str, Any] = {
+            "mode": "single_speaker",
+            "model": model_ref,
+            "model_patch": ["4", 0],
+            "positive": ["9", 0],
+            "negative": ["10", 0],
+            "vae": ["3", 0],
+            "width": w,
+            "height": h,
+            "length": chunk_len,
+            "audio_encoder_output_1": ["8", 0],
+            "motion_frame_count": 9,
+            "audio_scale": float(audio_scale or 1.0),
+            "start_image": ["6", 0],
+        }
+        if prev_decode_ref is not None:
+            inf_inputs["previous_frames"] = prev_decode_ref
+
+        wf[inf_id] = {"class_type": "WanInfiniteTalkToVideo", "inputs": inf_inputs}
+        wf[guider_id] = {
+            "class_type": "CFGGuider",
+            "inputs": {
+                "model": [inf_id, 0],
+                "positive": [inf_id, 1],
+                "negative": [inf_id, 2],
+                "cfg": effective_cfg,
+            },
+        }
+        wf[sched_id] = {
+            "class_type": "BasicScheduler",
+            "inputs": {"model": [inf_id, 0], "scheduler": "normal", "steps": effective_steps, "denoise": 1.0},
+        }
+        wf[noise_id] = {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed) + c_idx}}
+        wf[samp_id] = {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": [noise_id, 0],
+                "guider": [guider_id, 0],
+                "sampler": ["11", 0],
+                "sigmas": [sched_id, 0],
+                "latent_image": [inf_id, 3],
+            },
+        }
+        wf[dec_id] = {"class_type": "VAEDecode", "inputs": {"samples": [samp_id, 0], "vae": ["3", 0]}}
+        prev_decode_ref = [dec_id, 0]
+        decoded_refs.append([dec_id, 0])
+
+    if len(decoded_refs) == 1:
+        final_images_ref = decoded_refs[0]
+    else:
+        batch_id = str(next_id)
+        next_id += 1
+        batch_inputs = {f"images.image{i}": ref for i, ref in enumerate(decoded_refs)}
+        wf[batch_id] = {"class_type": "BatchImagesNode", "inputs": batch_inputs}
+        final_images_ref = [batch_id, 0]
+
+    create_id = str(next_id)
+    save_id = str(next_id + 1)
+    wf[create_id] = {
+        "class_type": "CreateVideo",
+        "inputs": {"images": final_images_ref, "audio": ["7", 0], "fps": fps},
+    }
+    wf[save_id] = {
+        "class_type": "SaveVideo",
+        "inputs": {
+            "video": [create_id, 0],
+            "filename_prefix": f"video/L3M_InfiniteTalk_{int(time.time())}",
+            "format": "auto",
+            "codec": "auto",
+        },
     }
     return wf
 
@@ -1250,6 +1412,250 @@ async def run_comfyui_video(
             job["progress"] = 98
             job["message"] = "正在封裝為瀏覽器相容 MP4 (H.264/AAC)..."
             final_path = await _transcode_to_mp4(raw_path, videos_dir / f"{base_stem}.mp4")
+
+        return final_path, model_meta
+
+
+async def _upload_audio_to_comfyui(
+    client: httpx.AsyncClient,
+    base_url: str,
+    audio_path: Path,
+    is_remote: bool = False,
+) -> str:
+    """Upload MP3/WAV audio into ComfyUI input/ (compressing huge WAVs to MP3 when uploading remotely)."""
+    upload_path = audio_path
+    tmp_mp3: Optional[Path] = None
+    ext = audio_path.suffix.lower()
+    if is_remote and ext == ".wav" and audio_path.stat().st_size > 2 * 1024 * 1024:
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin:
+            tmp_mp3 = audio_path.with_suffix(".upload.mp3")
+            ff_kwargs: Dict[str, Any] = {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.STDOUT}
+            if platform.system() == "Windows":
+                ff_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = await asyncio.create_subprocess_exec(
+                ffmpeg_bin, "-y", "-i", str(audio_path), "-b:a", "192k", str(tmp_mp3), **ff_kwargs
+            )
+            await proc.communicate()
+            if tmp_mp3.exists() and tmp_mp3.stat().st_size > 1024:
+                upload_path = tmp_mp3
+
+    payload = upload_path.read_bytes()
+    upload_name = upload_path.name
+    mime = "audio/mpeg" if upload_path.suffix.lower() == ".mp3" else "audio/wav"
+    if tmp_mp3:
+        tmp_mp3.unlink(missing_ok=True)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            files = {"image": (upload_name, payload, mime)}
+            data = {"type": "input", "overwrite": "true"}
+            resp = await client.post(f"{base_url}/upload/image", files=files, data=data)
+            resp.raise_for_status()
+            info = resp.json()
+            name = info.get("name", upload_name)
+            sub = info.get("subfolder", "")
+            return f"{sub}/{name}" if sub else name
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+    raise RuntimeError(f"上傳音訊至 ComfyUI 失敗（已重試 3 次）：{last_exc}")
+
+
+async def _probe_audio_duration_sec(audio_path: Path) -> float:
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        try:
+            ff_kwargs: Dict[str, Any] = {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.PIPE}
+            if platform.system() == "Windows":
+                ff_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = await asyncio.create_subprocess_exec(
+                ffprobe_bin, "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path), **ff_kwargs
+            )
+            out, _ = await proc.communicate()
+            val = float(out.decode("utf-8", errors="ignore").strip())
+            if val > 0.1:
+                return val
+        except Exception:
+            pass
+    if audio_path.suffix.lower() == ".wav":
+        try:
+            import wave
+            with wave.open(str(audio_path), "rb") as wf:
+                return wf.getnframes() / float(max(1, wf.getframerate()))
+        except Exception:
+            pass
+    return 5.0
+
+
+async def _extract_first_frame_if_video(portrait_path: Path) -> Path:
+    if portrait_path.suffix.lower() not in (".mp4", ".mov", ".webm", ".mkv", ".avi"):
+        return portrait_path
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        return portrait_path
+    out_img = portrait_path.with_suffix(".frame0.jpg")
+    ff_kwargs: Dict[str, Any] = {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.STDOUT}
+    if platform.system() == "Windows":
+        ff_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    proc = await asyncio.create_subprocess_exec(
+        ffmpeg_bin, "-y", "-i", str(portrait_path), "-vframes", "1", "-q:v", "2", str(out_img), **ff_kwargs
+    )
+    await proc.communicate()
+    if out_img.exists() and out_img.stat().st_size > 1024:
+        return out_img
+    return portrait_path
+
+
+async def run_comfyui_lipsync(
+    job: Dict[str, Any],
+    params: Dict[str, Any],
+    lipsync_dir: Path,
+    portrait_path: Path,
+    audio_path: Path,
+    is_cancelled: Callable[[], bool],
+    on_prompt_submitted: Callable[[str, str], None],
+) -> Tuple[Path, Dict[str, Any]]:
+    """Run InfiniteTalk + Wan2.1 audio-driven lip-sync video generation on local or Colab ComfyUI."""
+    req_mode = params.get("comfyui_mode")
+    status = await probe_comfyui(mode=req_mode, force=False)
+    if not status["online"] or not status.get("detected", {}).get("has_infinitetalk"):
+        status = await probe_comfyui(mode=req_mode, force=True)
+    if not status["online"]:
+        raise RuntimeError(
+            f"無法連線至 ComfyUI（{status['url']}）：{status.get('error') or '請確認 Colab 或本機 ComfyUI 已啟動'}。"
+        )
+    detected = status.get("detected") or {}
+    if not detected.get("has_infinitetalk"):
+        raise RuntimeError(
+            "目標 ComfyUI 尚未安裝完整 InfiniteTalk 對口型權重（需要 Wan2.1-I2V-14B、umt5_xxl、wan2.1_infiniteTalk_single、wav2vec2 與 Wan2.1 VAE）。"
+            "請在 Colab 筆記本步驟 3 勾選「DOWNLOAD_INFINITETALK」下載後重跑步驟 4！"
+        )
+
+    base_url = status["url"].rstrip("/")
+    _, _, headers, is_remote = resolve_comfyui_connection(base_url=base_url, mode=status.get("mode"))
+    node_prefix = "Colab ComfyUI" if is_remote else "ComfyUI"
+
+    res_str = str(params.get("resolution") or "480p").lower()
+    if res_str == "720p":
+        default_w, default_h = 832, 832
+    else:
+        default_w, default_h = 640, 640
+
+    # Match portrait aspect ratio cleanly around target pixel budget (480p ≈ 832x480, 720p ≈ 1024x640)
+    portrait_img_path = await _extract_first_frame_if_video(portrait_path)
+    width, height = default_w, default_h
+    try:
+        from PIL import Image  # type: ignore
+        with Image.open(portrait_img_path) as im:
+            iw, ih = im.size
+            if iw > 0 and ih > 0:
+                budget = (960 * 576) if res_str == "720p" else (768 * 480)
+                rw = (budget * iw / ih) ** 0.5
+                rh = rw * ih / iw
+                width = _snap(int(rw), 16, 384, 1024)
+                height = _snap(int(rh), 16, 384, 1024)
+    except Exception:
+        pass
+
+    audio_dur = await _probe_audio_duration_sec(audio_path)
+    max_dur = float(params.get("max_duration") or 12)
+    eff_dur = max(2.0, min(audio_dur, max(3.0, min(20.0, max_dur))))
+    steps = int(params.get("steps") or 6)
+    audio_scale = float(params.get("audio_scale") or 1.0)
+    prompt = str(params.get("prompt") or "").strip()
+    raw_seed = params.get("seed")
+    seed = int(raw_seed) if (raw_seed is not None and str(raw_seed).strip() != "") else random.randint(1, 2147483647)
+
+    async with httpx.AsyncClient(timeout=360.0 if is_remote else 180.0, headers=headers, follow_redirects=True) as client:
+        job["progress"] = 8
+        job["message"] = f"正在上傳人物圖片至 {node_prefix}..."
+        uploaded_portrait = await _upload_image_to_comfyui(client, base_url, portrait_img_path, is_remote=is_remote)
+        if is_cancelled():
+            raise asyncio.CancelledError()
+
+        job["progress"] = 12
+        job["message"] = f"正在上傳音訊檔案至 {node_prefix}（約 {audio_dur:.1f} 秒）..."
+        uploaded_audio = await _upload_audio_to_comfyui(client, base_url, audio_path, is_remote=is_remote)
+        if is_cancelled():
+            raise asyncio.CancelledError()
+
+        workflow = build_infinitetalk_lipsync_workflow(
+            detected=detected["infinitetalk"],
+            portrait_name=uploaded_portrait,
+            audio_name=uploaded_audio,
+            prompt=prompt,
+            width=width,
+            height=height,
+            duration_sec=eff_dur,
+            steps=steps,
+            seed=seed,
+            audio_scale=audio_scale,
+        )
+        model_meta = {
+            "id": "comfy_infinitetalk",
+            "name": f"{node_prefix} · InfiniteTalk Wan2.1",
+            "quantization": "Colab L4/A100" if is_remote else "FP8",
+        }
+        # Save computed dims & duration for gallery metadata
+        params["width"] = width
+        params["height"] = height
+        params["duration"] = round(eff_dur, 1)
+        params["steps"] = steps
+        if not params.get("prompt"):
+            params["prompt"] = f"對口型影片（{audio_path.name} · {eff_dur:.1f}s）"
+
+        hist_entry = await _submit_and_wait_comfyui(
+            client, base_url, workflow, model_meta["name"], job, is_cancelled, on_prompt_submitted, est_scale_sec=90.0
+        )
+
+        outputs = hist_entry.get("outputs", {})
+        video_file_info: Optional[Dict[str, Any]] = None
+        for _nid, node_out in outputs.items():
+            if not isinstance(node_out, dict):
+                continue
+            for key in ("videos", "images", "gifs"):
+                arr = node_out.get(key)
+                if isinstance(arr, list) and arr:
+                    for item in arr:
+                        fn = str(item.get("filename", ""))
+                        if fn.lower().endswith((".mp4", ".webm", ".mov", ".mkv", ".avi", ".gif")) or key in ("videos", "gifs"):
+                            video_file_info = item
+                            break
+                if video_file_info:
+                    break
+            if video_file_info:
+                break
+
+        if not video_file_info:
+            raise RuntimeError("ComfyUI 對口型工作流執行完畢，但未找到輸出影片檔。")
+
+        job["progress"] = 95
+        job["message"] = f"正在從 {node_prefix} 下載對口型成品影片..."
+        fname = video_file_info["filename"]
+        view_resp = await client.get(
+            f"{base_url}/view",
+            params={
+                "filename": fname,
+                "subfolder": video_file_info.get("subfolder", ""),
+                "type": video_file_info.get("type", "output"),
+            },
+        )
+        view_resp.raise_for_status()
+
+        ext = Path(fname).suffix.lower() or ".mp4"
+        base_stem = f"lipsync_{int(time.time())}_{job['id']}"
+        raw_path = lipsync_dir / f"{base_stem}{ext}"
+        raw_path.write_bytes(view_resp.content)
+
+        final_path = raw_path
+        if ext != ".mp4":
+            job["progress"] = 98
+            job["message"] = "正在封裝為瀏覽器相容 MP4 (H.264/AAC)..."
+            final_path = await _transcode_to_mp4(raw_path, lipsync_dir / f"{base_stem}.mp4")
 
         return final_path, model_meta
 

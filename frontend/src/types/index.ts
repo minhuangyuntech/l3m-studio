@@ -290,9 +290,11 @@ export interface ComfyUIStatus {
     has_ltx25?: boolean;
     has_minimax_h3?: boolean;
     has_minimax_turbo_lora?: boolean;
+    has_infinitetalk?: boolean;
     z_image?: Record<string, string>;
     ltx25?: Record<string, string>;
     minimax_h3?: Record<string, string>;
+    infinitetalk?: Record<string, string>;
   };
   presets: ComfyUIPreset[];
   image_presets?: ComfyUIImagePreset[];

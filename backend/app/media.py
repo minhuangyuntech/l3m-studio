@@ -21,7 +21,14 @@ from .config import APP_HOME, ENGINES_DIR, config_manager
 from .engine import engine_manager
 from .hardware import get_hardware_info
 from .models import scan_local_models
-from .video_backends import interrupt_comfyui, probe_comfyui, run_comfyui_image, run_comfyui_video, run_jimeng_video
+from .video_backends import (
+    interrupt_comfyui,
+    probe_comfyui,
+    run_comfyui_image,
+    run_comfyui_lipsync,
+    run_comfyui_video,
+    run_jimeng_video,
+)
 
 OUTPUTS_DIR = APP_HOME / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
@@ -823,8 +830,8 @@ class MediaManager:
             "id": job_id,
             "kind": "lipsync",
             "status": "running",
-            "progress": 10,
-            "message": "正在檢查 D:\\AI-Models\\lipsync 環境與權重...",
+            "progress": 5,
+            "message": "正在準備 ComfyUI InfiniteTalk 對口型任務...",
             "params": {k: v for k, v in params.items() if not k.endswith("_data_url")},
             "created_at": time.time(),
             "elapsed_seconds": 0.0,
@@ -838,32 +845,53 @@ class MediaManager:
     async def _run_lipsync_job(self, job: Dict[str, Any], params: Dict[str, Any]) -> None:
         t0 = time.monotonic()
         try:
-            lipsync_root = Path("D:/AI-Models/lipsync")
-            if not lipsync_root.exists():
-                raise RuntimeError("找不到 D:\\AI-Models\\lipsync 目錄。")
             if not params.get("portrait_data_url") or not params.get("audio_data_url"):
                 raise ValueError("請同時上傳人物照片/影片以及音訊檔案。")
+
+            comfy_mode = str(params.get("comfyui_mode") or config_manager.config.comfyui_mode or "local").lower()
+            if comfy_mode != "remote" and params.get("auto_unload_llm", True) and (
+                engine_manager.status in ("running", "starting")
+                or engine_manager.find_external_llama_servers()
+            ):
+                job["message"] = "正在自動停止背景 LLM 釋放本機顯卡 VRAM..."
+                await engine_manager.stop_all_llama_servers()
+                await asyncio.sleep(1.0)
 
             portrait = _save_base64_upload(params["portrait_data_url"], "portrait")
             audio = _save_base64_upload(params["audio_data_url"], "audio")
 
-            # If ComfyUI URL is configured and reachable, dispatch cleanly; otherwise report ready status & script hook
-            comfy_url = config_manager.config.comfyui_url.strip()
-            if comfy_url:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    r = await client.get(f"{comfy_url.rstrip('/')}/system_stats")
-                    if r.status_code == 200:
-                        job["message"] = f"已偵測到 ComfyUI ({comfy_url})，素材已暫存至 {portrait.name} / {audio.name}"
-
-            raise RuntimeError(
-                f"已偵測到 InfiniteTalk + Wan2.1 權重與 CUDA 環境（素材已暫存：{portrait.name}、{audio.name}）。"
-                "請啟動本機 ComfyUI 並載入 InfiniteTalk 工作流，或在設定指定自訂對口型推理腳本路徑。"
+            final_out, model_meta = await run_comfyui_lipsync(
+                job=job,
+                params=params,
+                lipsync_dir=LIPSYNC_DIR,
+                portrait_path=portrait,
+                audio_path=audio,
+                is_cancelled=lambda: job["id"] in self._cancelled_jobs,
+                on_prompt_submitted=lambda u, pid: self._job_comfy_prompts.__setitem__(job["id"], (u, pid)),
             )
-        except Exception as exc:
-            job["status"] = "error"
-            job["error"] = str(exc)
+            self._register_output(job, model_meta, final_out, "lipsync", params, time.monotonic() - t0)
+            job["status"] = "completed"
+            job["progress"] = 100
             job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
-            job["message"] = str(exc)
+            job["message"] = f"對口型影片生成完成（耗時 {job['elapsed_seconds']}s）"
+        except (JobCancelledError, asyncio.CancelledError):
+            job["status"] = "cancelled"
+            job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
+            job["message"] = f"已強制取消對口型作業（已執行 {job['elapsed_seconds']}s）"
+            job["error"] = ""
+        except Exception as exc:
+            if job["id"] in self._cancelled_jobs:
+                job["status"] = "cancelled"
+                job["message"] = "已強制取消對口型作業"
+                job["error"] = ""
+            else:
+                job["status"] = "error"
+                job["error"] = str(exc)
+                job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
+                job["message"] = f"對口型生成失敗：{exc}"
+        finally:
+            self._job_comfy_prompts.pop(job["id"], None)
+            self._cancelled_jobs.discard(job["id"])
 
     async def _exec_media_cli(self, cmd: List[str], job: Dict[str, Any]) -> None:
         import re

@@ -109,14 +109,16 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   const [firstFrameDims, setFirstFrameDims] = useState<[number, number] | null>(null);
   const [lastFrame, setLastFrame] = useState<string | null>(null);
 
-  // Lipsync Controls
+  // Lipsync Controls (ComfyUI InfiniteTalk + Wan2.1)
   const [portraitData, setPortraitData] = useState<string | null>(null);
   const [portraitName, setPortraitName] = useState('');
   const [audioData, setAudioData] = useState<string | null>(null);
   const [audioName, setAudioName] = useState('');
-  const [separateVocal, setSeparateVocal] = useState(true);
+  const [lipsyncPrompt, setLipsyncPrompt] = useState('');
   const [lipsyncRes, setLipsyncRes] = useState<'480p' | '720p'>('480p');
-  const [lowVram, setLowVram] = useState(true);
+  const [lipsyncSteps, setLipsyncSteps] = useState(6);
+  const [lipsyncMaxDur, setLipsyncMaxDur] = useState(12);
+  const [lipsyncAudioScale, setLipsyncAudioScale] = useState(1.0);
 
   const [notice, setNotice] = useState('');
   const [copiedId, setCopiedId] = useState('');
@@ -362,18 +364,31 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   };
 
   const handleGenerateLipsync = async () => {
+    if (!portraitData || !audioData) return;
+    if (!comfyOnline) {
+      setNotice('ComfyUI 尚未連線，請先確認 Colab 或本機 ComfyUI 已連線。');
+      return;
+    }
     setNotice('');
+    setSubmitting(true);
     try {
-      await api.generateLipsync({
+      const createdJob = await api.generateLipsync({
+        comfyui_mode: comfyMode,
         portrait_data_url: portraitData,
         audio_data_url: audioData,
-        separate_vocal: separateVocal,
+        prompt: lipsyncPrompt.trim(),
         resolution: lipsyncRes,
-        low_vram: lowVram,
+        steps: lipsyncSteps,
+        max_duration: lipsyncMaxDur,
+        audio_scale: lipsyncAudioScale,
+        auto_unload_llm: autoUnloadLlm,
       });
-      await loadAll();
+      setJobs((prev) => [createdJob, ...prev.filter((x) => x.id !== createdJob.id)]);
+      await loadFast();
     } catch (err: any) {
       setNotice(err.message);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -638,7 +653,11 @@ export const VideoPage: React.FC<VideoPageProps> = ({
                     ? comfyOnline
                       ? `已連線本機 ComfyUI v${mediaInfo?.comfyui_status?.version || ''}（偵測到 ${Math.max(0, (mediaInfo?.comfyui_status?.presets?.length || 1) - 1)} 組 INT8 高畫質影片管線），亦可隨時切換「即夢 API」雲端生成。`
                       : '可在右側選擇 ComfyUI 高畫質本機管線或「即夢 API」雲端引擎開始生成。'
-                    : `已掃描到 ${mediaInfo?.lipsync_models.length ?? 0} 個對口型模型（Wan2.1-I2V-14B / InfiniteTalk），CUDA 環境狀態：${mediaInfo?.engines.lipsync_env_ready ? '已就緒' : '未偵測'}。`}
+                    : comfyOnline
+                      ? mediaInfo?.comfyui_status?.detected?.has_infinitetalk
+                        ? `已偵測到 ${mediaInfo.comfyui_status.is_remote ? 'Colab Pro' : '本機'} ComfyUI InfiniteTalk + Wan2.1 14B 引擎（${mediaInfo.comfyui_status.gpu_name || 'GPU 就緒'}），上傳正面人像與 MP3/WAV 音訊即可生成對口型影片。`
+                        : '已連上 ComfyUI，但尚未偵測到 InfiniteTalk 權重。請在 Colab 筆記本步驟 3 勾選 DOWNLOAD_INFINITETALK 並重跑步驟 4。'
+                      : '請在右側選擇「雲端 Colab Pro」貼上網址（或啟動本機 ComfyUI）即可執行 InfiniteTalk 對口型影片生成。'}
                 </p>
               </div>
             )}
@@ -1340,18 +1359,78 @@ export const VideoPage: React.FC<VideoPageProps> = ({
               )}
             </>
           ) : (
-            /* LIPSYNC INSPECTOR */
+            /* LIPSYNC INSPECTOR (ComfyUI InfiniteTalk + Wan2.1 — Local or Colab Pro) */
             <>
-              <div className="rounded-xl bg-paper p-3 border border-paper-border text-xs space-y-1">
-                <div className="font-bold text-cyan-300 flex items-center justify-between">
-                  <span>InfiniteTalk + Wan2.1 引擎</span>
-                  <span className="font-mono text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-400">
-                    {mediaInfo?.engines.lipsync_env_ready ? 'CUDA 環境就緒' : '待設定'}
+              {/* ComfyUI Node Switcher (Local vs Colab Pro) */}
+              <div className="rounded-xl bg-paper p-2.5 border border-paper-border space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-semibold text-slateink-muted">ComfyUI 算力節點</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      disabled={switchingNode}
+                      onClick={() => handleSwitchComfyNode('local')}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${
+                        comfyMode === 'local'
+                          ? 'bg-cyan-500/20 border border-cyan-400/60 text-cyan-200'
+                          : 'text-slateink-muted hover:text-slateink'
+                      }`}
+                    >
+                      本機 GPU
+                    </button>
+                    <button
+                      type="button"
+                      disabled={switchingNode}
+                      onClick={() => handleSwitchComfyNode('remote')}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${
+                        comfyMode === 'remote'
+                          ? 'bg-indigo-500/25 border border-indigo-400/60 text-indigo-200'
+                          : 'text-slateink-muted hover:text-slateink'
+                      }`}
+                    >
+                      雲端 Colab Pro
+                    </button>
+                  </div>
+                </div>
+                {comfyMode === 'remote' && (
+                  <div className="flex gap-1.5">
+                    <input
+                      value={colabUrlDraft}
+                      onChange={(e) => setColabUrlDraft(e.target.value)}
+                      placeholder="貼上 https://xxxx.trycloudflare.com"
+                      className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-paper-card border border-indigo-500/35 text-[11px] font-mono text-slateink focus:outline-none focus:border-indigo-400"
+                    />
+                    <button
+                      type="button"
+                      disabled={switchingNode || !colabUrlDraft.trim()}
+                      onClick={() => handleSwitchComfyNode('remote', colabUrlDraft)}
+                      className="px-2.5 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-semibold shrink-0 disabled:opacity-45"
+                    >
+                      {switchingNode ? '連線中' : '連線'}
+                    </button>
+                  </div>
+                )}
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="font-bold text-cyan-300">InfiniteTalk + Wan2.1 14B</span>
+                  <span
+                    className={`font-mono text-[10px] px-2 py-0.5 rounded-full ${
+                      mediaInfo?.comfyui_status?.detected?.has_infinitetalk
+                        ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                        : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                    }`}
+                  >
+                    {mediaInfo?.comfyui_status?.detected?.has_infinitetalk
+                      ? `${mediaInfo.comfyui_status.is_remote ? 'Colab' : '本機'} 權重就緒`
+                      : comfyOnline
+                        ? '尚未下載 InfiniteTalk'
+                        : 'ComfyUI 未連線'}
                   </span>
                 </div>
-                <div className="text-[11px] text-slateink-muted">
-                  已偵測 {mediaInfo?.lipsync_models.length ?? 0} 個權重（D:\AI-Models\lipsync）
-                </div>
+                {comfyOnline && !mediaInfo?.comfyui_status?.detected?.has_infinitetalk && (
+                  <div className="text-[10px] text-amber-200/90 leading-relaxed">
+                    請於 Colab 筆記本步驟 3 勾選 <span className="font-mono">DOWNLOAD_INFINITETALK</span>（免 Token）下載 6 個官方檔並重跑步驟 4，完成後點右上重新整理即可啟用。
+                  </div>
+                )}
               </div>
 
               <input
@@ -1385,34 +1464,51 @@ export const VideoPage: React.FC<VideoPageProps> = ({
 
               <button
                 onClick={() => portraitRef.current?.click()}
-                className="w-full p-4 rounded-xl border border-dashed border-paper-border hover:border-cyan-400/60 bg-paper flex items-center gap-3 text-left transition"
+                className="w-full p-3.5 rounded-xl border border-dashed border-paper-border hover:border-cyan-400/60 bg-paper flex items-center gap-3 text-left transition"
               >
-                <UserSquare2 className="w-6 h-6 text-cyan-400 shrink-0" />
+                {portraitData && portraitData.startsWith('data:image') ? (
+                  <img src={portraitData} alt="人像" className="w-11 h-11 rounded-lg object-cover shrink-0 border border-cyan-500/40" />
+                ) : (
+                  <UserSquare2 className="w-6 h-6 text-cyan-400 shrink-0" />
+                )}
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold text-slateink">
+                  <div className="text-xs font-semibold text-slateink truncate">
                     {portraitName || '上傳人物照片或影片'}
                   </div>
-                  <div className="text-[11px] text-slateink-muted">支援正面人像 JPG / PNG / MP4</div>
+                  <div className="text-[11px] text-slateink-muted">支援正面人像 JPG / PNG / MP4（自動取首幀與對齊比例）</div>
                 </div>
               </button>
 
               <button
                 onClick={() => audioRef.current?.click()}
-                className="w-full p-4 rounded-xl border border-dashed border-paper-border hover:border-indigo-400/60 bg-paper flex items-center gap-3 text-left transition"
+                className="w-full p-3.5 rounded-xl border border-dashed border-paper-border hover:border-indigo-400/60 bg-paper flex items-center gap-3 text-left transition"
               >
                 <Music className="w-6 h-6 text-indigo-400 shrink-0" />
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold text-slateink">
+                  <div className="text-xs font-semibold text-slateink truncate">
                     {audioName || '上傳人聲或歌曲音訊'}
                   </div>
-                  <div className="text-[11px] text-slateink-muted">支援 MP3 / WAV（可自動分離人聲）</div>
+                  <div className="text-[11px] text-slateink-muted">支援 MP3 / WAV（自動依音訊長度分段延展對口型）</div>
                 </div>
               </button>
+
+              <div>
+                <label className="block text-[11px] font-bold text-slateink-muted mb-1">
+                  動作／表情描述（可選）
+                </label>
+                <input
+                  value={lipsyncPrompt}
+                  onChange={(e) => setLipsyncPrompt(e.target.value)}
+                  placeholder="例如：自然微笑看鏡頭說話，微微點頭，柔和自然光..."
+                  className="w-full px-3 py-2 rounded-xl bg-paper border border-paper-border text-xs text-slateink focus:outline-none focus:border-cyan-400"
+                />
+              </div>
 
               <div className="grid grid-cols-2 gap-2 text-xs">
                 {(['480p', '720p'] as const).map((r) => (
                   <button
                     key={r}
+                    type="button"
                     onClick={() => setLipsyncRes(r)}
                     className={`py-2 rounded-xl border font-mono font-semibold ${
                       lipsyncRes === r
@@ -1420,30 +1516,46 @@ export const VideoPage: React.FC<VideoPageProps> = ({
                         : 'bg-paper border-paper-border text-slateink-muted'
                     }`}
                   >
-                    {r.toUpperCase()}
+                    {r.toUpperCase()} {r === '480p' ? '(推薦·快)' : '(高清)'}
                   </button>
                 ))}
               </div>
 
-              <div className="space-y-2 text-xs">
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-paper border border-paper-border cursor-pointer">
-                  <span>Demucs 自動分離背景音樂與人聲</span>
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <div>
+                  <label className="block text-[11px] text-slateink-muted mb-1">步數 (6步快)</label>
                   <input
-                    type="checkbox"
-                    checked={separateVocal}
-                    onChange={(e) => setSeparateVocal(e.target.checked)}
-                    className="accent-cyan-500"
+                    type="number"
+                    min={4}
+                    max={25}
+                    value={lipsyncSteps}
+                    onChange={(e) => setLipsyncSteps(Number(e.target.value))}
+                    className="w-full px-2.5 py-2 rounded-xl bg-paper border border-paper-border font-mono"
                   />
-                </label>
-                <label className="flex items-center justify-between p-2.5 rounded-xl bg-paper border border-paper-border cursor-pointer">
-                  <span>8GB 顯存省記憶體模式（RTX 4070 推薦）</span>
+                </div>
+                <div>
+                  <label className="block text-[11px] text-slateink-muted mb-1">時長上限(秒)</label>
                   <input
-                    type="checkbox"
-                    checked={lowVram}
-                    onChange={(e) => setLowVram(e.target.checked)}
-                    className="accent-cyan-500"
+                    type="number"
+                    min={3}
+                    max={20}
+                    value={lipsyncMaxDur}
+                    onChange={(e) => setLipsyncMaxDur(Number(e.target.value))}
+                    className="w-full px-2.5 py-2 rounded-xl bg-paper border border-paper-border font-mono"
                   />
-                </label>
+                </div>
+                <div>
+                  <label className="block text-[11px] text-slateink-muted mb-1">口型強度</label>
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0.5}
+                    max={2.0}
+                    value={lipsyncAudioScale}
+                    onChange={(e) => setLipsyncAudioScale(Number(e.target.value))}
+                    className="w-full px-2.5 py-2 rounded-xl bg-paper border border-paper-border font-mono"
+                  />
+                </div>
               </div>
 
               {activeJob ? (
@@ -1458,11 +1570,13 @@ export const VideoPage: React.FC<VideoPageProps> = ({
               ) : (
                 <button
                   onClick={handleGenerateLipsync}
-                  disabled={!portraitData || !audioData}
+                  disabled={submitting || !portraitData || !audioData}
                   className="l3m-btn-primary w-full py-3 rounded-xl text-sm flex items-center justify-center gap-2 disabled:opacity-45"
                 >
                   <Mic className="w-4 h-4" />
-                  生成對口型影片
+                  {submitting
+                    ? '正在送出對口型任務...'
+                    : `透過 ${comfyMode === 'remote' ? 'Colab Pro' : '本機'} ComfyUI 生成對口型影片`}
                 </button>
               )}
             </>
