@@ -6,6 +6,7 @@ import type {
   ChatDetail,
   ChatSummary,
   ComfyUIStatus,
+  ComfyUIWorkflowSummary,
   DownloadTask,
   EngineInfo,
   EngineStatus,
@@ -163,6 +164,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ url: url || '' }),
     }),
+  getComfyuiWorkflows: (kind?: 'image' | 'video', force = false) =>
+    req<{ online: boolean; url: string; workflows: ComfyUIWorkflowSummary[] }>(
+      `/api/media/comfyui/workflows?${kind ? `kind=${kind}&` : ''}${force ? 'force=true' : ''}`,
+    ),
   getMediaGallery: (kind?: string) =>
     req<{ items: MediaGalleryItem[] }>(
       kind ? `/api/media/gallery?kind=${encodeURIComponent(kind)}` : '/api/media/gallery',

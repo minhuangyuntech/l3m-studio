@@ -15,6 +15,7 @@ from .chat import chat_manager
 from .config import config_manager
 from .engine import engine_manager
 from .hardware import get_hardware_info, get_realtime_metrics
+from .comfy_workflows import fetch_comfyui_workflow_raw
 from .media import IMAGES_DIR, LIPSYNC_DIR, VIDEOS_DIR, media_manager
 from .video_backends import probe_comfyui
 from .models import (
@@ -332,6 +333,30 @@ async def media_comfyui_status(force: bool = Query(default=False)) -> Dict[str, 
 async def media_comfyui_test(body: Dict[str, Any]) -> Dict[str, Any]:
     url = str(body.get("url") or "").strip() or None
     return await probe_comfyui(base_url=url, force=True, timeout=4.0)
+
+
+@router.get("/media/comfyui/workflows")
+async def media_comfyui_workflows(
+    kind: Optional[str] = Query(default=None),
+    force: bool = Query(default=False),
+) -> Dict[str, Any]:
+    status = await probe_comfyui(force=force)
+    items = status.get("workflows") or []
+    if kind in ("image", "video"):
+        items = [w for w in items if w.get("kind") == kind or w.get("source") == "user"]
+    return {"online": status.get("online", False), "url": status.get("url", ""), "workflows": items}
+
+
+@router.get("/media/comfyui/workflows/detail")
+async def media_comfyui_workflow_detail(workflow_id: str = Query(...)) -> Dict[str, Any]:
+    status = await probe_comfyui()
+    if not status.get("online"):
+        raise HTTPException(status_code=503, detail="ComfyUI 未連線")
+    try:
+        raw, name = await fetch_comfyui_workflow_raw(status["url"], workflow_id)
+        return {"workflow_id": workflow_id, "name": name, "workflow": raw}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"讀取 ComfyUI 工作流失敗：{exc}")
 
 
 @router.get("/media/gallery")

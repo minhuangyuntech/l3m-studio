@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import platform
 import random
@@ -10,10 +9,17 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import httpx
 
+from .comfy_workflows import (
+    convert_ui_workflow_to_api,
+    fetch_comfyui_workflow_raw,
+    get_comfy_object_info,
+    inject_workflow_params,
+    list_comfyui_workflows,
+)
 from .config import config_manager
 
 # Short TTL cache for ComfyUI status probes so 2.5s UI polling stays instant
@@ -46,7 +52,7 @@ def _extract_combo_list(node_info: Dict[str, Any], key: str) -> List[str]:
 
 
 async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, timeout: float = 3.0) -> Dict[str, Any]:
-    """Probe a running ComfyUI server and detect available high-precision video pipelines."""
+    """Probe a running ComfyUI server and detect available image/video pipelines & installed workflows."""
     configured = (base_url or config_manager.config.comfyui_url or "http://127.0.0.1:8000").strip().rstrip("/")
     now = time.monotonic()
     if (
@@ -69,6 +75,7 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
         "version": "",
         "gpu_name": "",
         "error": "",
+        "checkpoints": [],
         "unets": [],
         "clips": [],
         "vaes": [],
@@ -76,6 +83,8 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
         "loras": [],
         "detected": {},
         "presets": [],
+        "image_presets": [],
+        "workflows": [],
     }
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -109,8 +118,8 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
         if devices:
             result["gpu_name"] = str(devices[0].get("name", ""))
 
-        # Query only the specific loader/video nodes we need (fast & lightweight)
         node_names = [
+            "CheckpointLoaderSimple",
             "UNETLoader",
             "CLIPLoader",
             "VAELoader",
@@ -118,6 +127,7 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
             "LoraLoaderModelOnly",
             "MiniMaxH3ImageToVideo",
             "LTXVDualCFGGuider",
+            "ModelSamplingAuraFlow",
         ]
         node_infos: Dict[str, Any] = {}
         responses = await asyncio.gather(
@@ -133,19 +143,30 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
                 except Exception:
                     pass
 
+        checkpoints = _extract_combo_list(node_infos.get("CheckpointLoaderSimple", {}), "ckpt_name")
         unets = _extract_combo_list(node_infos.get("UNETLoader", {}), "unet_name")
         clips = _extract_combo_list(node_infos.get("CLIPLoader", {}), "clip_name")
         vaes = _extract_combo_list(node_infos.get("VAELoader", {}), "vae_name")
         upscalers = _extract_combo_list(node_infos.get("LatentUpscaleModelLoader", {}), "model_name")
         loras = _extract_combo_list(node_infos.get("LoraLoaderModelOnly", {}), "lora_name")
 
+        # Filter out video-only checkpoints (like ltx-2.3) from image checkpoint selector
+        image_checkpoints = [c for c in checkpoints if "ltx-" not in c.lower() and "wan2" not in c.lower()]
+
+        result["checkpoints"] = image_checkpoints
         result["unets"] = unets
         result["clips"] = clips
         result["vaes"] = vaes
         result["upscalers"] = upscalers
         result["loras"] = loras
 
-        # Detect LTX-2.5 22B Distilled INT8 pipeline
+        # Detect Z-Image-Turbo BF16 image pipeline
+        z_unet = _pick(unets, "z_image_turbo") or _pick(unets, "z-image-turbo") or _pick(unets, "z_image")
+        z_clip = _pick(clips, "qwen_3_4b") or _pick(clips, "qwen3_4b") or _pick(clips, "qwen-3-4b")
+        z_vae = _pick(vaes, "ae.safetensors") or _pick(vaes, "ae.")
+        has_z_image = bool(z_unet and z_clip and z_vae)
+
+        # Detect LTX-2.5 22B Distilled INT8 video pipeline
         ltx_unet = _pick(unets, "ltx-2.5") or _pick(unets, "ltx2.5") or _pick(unets, "ltx")
         ltx_clip = _pick(clips, "gemma4", "ltx-2.5") or _pick(clips, "gemma4", "ltx") or _pick(clips, "gemma")
         ltx_v_vae = _pick(vaes, "ltx-2.5", "video") or _pick(vaes, "ltx", "video")
@@ -155,7 +176,7 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
             ltx_unet and ltx_clip and ltx_v_vae and ltx_a_vae and ltx_up and "LTXVDualCFGGuider" in node_infos
         )
 
-        # Detect MiniMax-H3 FL2VA INT8 pipeline
+        # Detect MiniMax-H3 FL2VA INT8 video pipeline
         mm_unet = _pick(unets, "minimax_h3") or _pick(unets, "minimax")
         mm_clip = _pick(clips, "minimax_h3") or _pick(clips, "qwen3vl", "minimax")
         mm_v_vae = _pick(vaes, "minimax_h3", "video") or _pick(vaes, "minimax", "video")
@@ -164,6 +185,13 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
         has_minimax = bool(mm_unet and mm_clip and mm_v_vae and mm_a_vae and "MiniMaxH3ImageToVideo" in node_infos)
 
         result["detected"] = {
+            "has_z_image": has_z_image,
+            "z_image": {
+                "unet": z_unet,
+                "clip": z_clip,
+                "vae": z_vae,
+            },
+            "has_checkpoints": bool(image_checkpoints),
             "has_ltx25": has_ltx25,
             "ltx25": {
                 "unet": ltx_unet,
@@ -183,6 +211,46 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
             },
         }
 
+        # Auto-discover installed ComfyUI workflows (user saved + extensions + templates)
+        installed_files: Set[str] = set(checkpoints + unets + clips + vaes + loras)
+        workflows = await list_comfyui_workflows(active_url, installed_files=installed_files, force=force)
+        result["workflows"] = workflows
+
+        # Build Image Presets
+        image_presets: List[Dict[str, Any]] = []
+        if has_z_image:
+            image_presets.append({
+                "id": "comfy_z_image_turbo",
+                "name": "Z-Image-Turbo BF16（ComfyUI 高畫質推薦）",
+                "description": "官方 BF16 原版精度 + Qwen3-4B 中文語意理解 + 8步高速採樣（畫質大幅優於 Q3 量化）。",
+                "default_steps": 8,
+                "badge": "BF16 · 推薦",
+            })
+        if image_checkpoints:
+            image_presets.append({
+                "id": "comfy_checkpoint",
+                "name": f"ComfyUI Checkpoints（SDXL / SD1.5 · {len(image_checkpoints)} 個模型）",
+                "description": "直接使用 ComfyUI 已安裝的 SDXL / SD1.5 / 寫實人像底模，並支援掛載 ComfyUI LoRA。",
+                "default_steps": 24,
+                "badge": f"{len(image_checkpoints)} 底模",
+            })
+        image_presets.append({
+            "id": "comfy_saved_workflow",
+            "name": f"執行 ComfyUI 已安裝工作流（已自動載入 {len(workflows)} 個）",
+            "description": "自動載入 ComfyUI 使用者工作流、擴充節點與官方範本，自動轉換並注入提示詞、尺寸與參考圖。",
+            "default_steps": 20,
+            "badge": "自動載入",
+        })
+        image_presets.append({
+            "id": "comfy_custom_json",
+            "name": "匯入自訂 ComfyUI 工作流 (JSON)",
+            "description": "支援標準 ComfyUI 工作流 JSON 與 Export (API) JSON（自動轉換執行）。",
+            "default_steps": 20,
+            "badge": "自訂 JSON",
+        })
+        result["image_presets"] = image_presets
+
+        # Build Video Presets
         presets: List[Dict[str, Any]] = []
         if has_ltx25:
             presets.append({
@@ -221,15 +289,26 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
                 "badge": "INT8 · 高品質",
             })
         presets.append({
-            "id": "comfy_custom_json",
-            "name": "自訂 ComfyUI API 工作流 (JSON)",
-            "description": "匯入 ComfyUI 匯出的 API 格式 JSON（自動注入提示詞、種子與首尾幀圖片）。",
+            "id": "comfy_saved_workflow",
+            "name": f"執行 ComfyUI 已安裝工作流（已自動載入 {len(workflows)} 個）",
+            "description": "自動載入 ComfyUI 內已安裝的影片工作流與官方範本（支援 UI 與 API 格式自動轉換）。",
             "default_steps": 20,
             "default_duration": 5,
             "supports_first_frame": True,
             "supports_last_frame": True,
             "supports_audio": True,
-            "badge": "進階自訂",
+            "badge": "自動載入",
+        })
+        presets.append({
+            "id": "comfy_custom_json",
+            "name": "匯入自訂 ComfyUI 工作流 (JSON)",
+            "description": "匯入 ComfyUI UI 或 API 格式 JSON（自動注入提示詞、種子與首尾幀圖片）。",
+            "default_steps": 20,
+            "default_duration": 5,
+            "supports_first_frame": True,
+            "supports_last_frame": True,
+            "supports_audio": True,
+            "badge": "自訂 JSON",
         })
         result["presets"] = presets
 
@@ -254,6 +333,197 @@ def _snap(val: int, mult: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, int(round(val / mult) * mult)))
 
 
+# ---------- Built-in ComfyUI Image Workflows ----------
+
+
+def build_z_image_turbo_workflow(
+    detected: Dict[str, str],
+    prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    batch_size: int,
+    seed: int,
+    lora_name: str = "",
+    lora_strength: float = 0.8,
+    ref_image_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Official ComfyUI v0.46.0 Z-Image-Turbo BF16 workflow (supports optional LoRA & img2img)."""
+    w = _snap(width, 64, 512, 2048)
+    h = _snap(height, 64, 512, 2048)
+    effective_steps = max(4, min(30, int(steps or 8)))
+    bs = max(1, min(4, int(batch_size or 1)))
+
+    wf: Dict[str, Any] = {
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {"unet_name": detected["unet"], "weight_dtype": "default"},
+        },
+        "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {"clip_name": detected["clip"], "type": "lumina2", "device": "default"},
+        },
+        "3": {
+            "class_type": "VAELoader",
+            "inputs": {"vae_name": detected["vae"]},
+        },
+    }
+
+    model_ref: Any = ["1", 0]
+    if lora_name:
+        wf["4"] = {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {
+                "model": ["1", 0],
+                "lora_name": lora_name,
+                "strength_model": float(lora_strength),
+            },
+        }
+        model_ref = ["4", 0]
+
+    wf["5"] = {
+        "class_type": "ModelSamplingAuraFlow",
+        "inputs": {"model": model_ref, "shift": 3.0},
+    }
+    wf["6"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}}
+    wf["7"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["6", 0]}}
+
+    denoise = 1.0
+    if ref_image_name:
+        wf["8"] = {"class_type": "LoadImage", "inputs": {"image": ref_image_name}}
+        wf["9"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["8", 0], "vae": ["3", 0]}}
+        latent_ref: Any = ["9", 0]
+        denoise = 0.72
+    else:
+        wf["8"] = {
+            "class_type": "EmptySD3LatentImage",
+            "inputs": {"width": w, "height": h, "batch_size": bs},
+        }
+        latent_ref = ["8", 0]
+
+    wf["10"] = {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": ["5", 0],
+            "positive": ["6", 0],
+            "negative": ["7", 0],
+            "latent_image": latent_ref,
+            "seed": int(seed),
+            "steps": effective_steps,
+            "cfg": 1.0,
+            "sampler_name": "res_multistep",
+            "scheduler": "simple",
+            "denoise": denoise,
+        },
+    }
+    if w * h > 1024 * 1024:
+        wf["11"] = {
+            "class_type": "VAEDecodeTiled",
+            "inputs": {
+                "samples": ["10", 0],
+                "vae": ["3", 0],
+                "tile_size": 512,
+                "overlap": 64,
+                "temporal_size": 64,
+                "temporal_overlap": 8,
+            },
+        }
+    else:
+        wf["11"] = {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}}
+
+    wf["12"] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": ["11", 0], "filename_prefix": f"L3M_ZImage_{int(time.time())}"},
+    }
+    return wf
+
+
+def build_checkpoint_image_workflow(
+    ckpt_name: str,
+    prompt: str,
+    neg_prompt: str,
+    width: int,
+    height: int,
+    steps: int,
+    batch_size: int,
+    seed: int,
+    cfg: float = 7.0,
+    lora_name: str = "",
+    lora_strength: float = 0.8,
+    ref_image_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Standard ComfyUI CheckpointLoaderSimple workflow (SDXL / SD1.5 / SD3.5) with optional LoRA & img2img."""
+    low = ckpt_name.lower()
+    is_sdxl = "sdxl" in low or "sd_xl" in low or "xl" in low or "sd3.5" in low
+    w = _snap(width, 64, 512, 2048)
+    h = _snap(height, 64, 512, 2048)
+    effective_steps = max(4, min(60, int(steps or (24 if is_sdxl else 25))))
+    bs = max(1, min(4, int(batch_size or 1)))
+    effective_neg = neg_prompt.strip() or "lowres, bad anatomy, bad hands, blurry, worst quality, watermark"
+
+    wf: Dict[str, Any] = {
+        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt_name}},
+    }
+    model_ref: Any = ["1", 0]
+    clip_ref: Any = ["1", 1]
+    vae_ref: Any = ["1", 2]
+
+    if lora_name:
+        wf["2"] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "model": model_ref,
+                "clip": clip_ref,
+                "lora_name": lora_name,
+                "strength_model": float(lora_strength),
+                "strength_clip": float(lora_strength),
+            },
+        }
+        model_ref = ["2", 0]
+        clip_ref = ["2", 1]
+
+    wf["3"] = {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": clip_ref}}
+    wf["4"] = {"class_type": "CLIPTextEncode", "inputs": {"text": effective_neg, "clip": clip_ref}}
+
+    denoise = 1.0
+    if ref_image_name:
+        wf["5"] = {"class_type": "LoadImage", "inputs": {"image": ref_image_name}}
+        wf["6"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["5", 0], "vae": vae_ref}}
+        latent_ref: Any = ["6", 0]
+        denoise = 0.72
+    else:
+        wf["5"] = {
+            "class_type": "EmptyLatentImage",
+            "inputs": {"width": w, "height": h, "batch_size": bs},
+        }
+        latent_ref = ["5", 0]
+
+    wf["7"] = {
+        "class_type": "KSampler",
+        "inputs": {
+            "model": model_ref,
+            "positive": ["3", 0],
+            "negative": ["4", 0],
+            "latent_image": latent_ref,
+            "seed": int(seed),
+            "steps": effective_steps,
+            "cfg": float(cfg or (7.0 if not "sd3.5" in low else 4.5)),
+            "sampler_name": "dpmpp_2m" if is_sdxl else "euler_ancestral",
+            "scheduler": "karras" if is_sdxl else "normal",
+            "denoise": denoise,
+        },
+    }
+    wf["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": vae_ref}}
+    wf["9"] = {
+        "class_type": "SaveImage",
+        "inputs": {"images": ["8", 0], "filename_prefix": f"L3M_Ckpt_{int(time.time())}"},
+    }
+    return wf
+
+
+# ---------- Built-in ComfyUI Video Workflows ----------
+
+
 def build_ltx25_workflow(
     detected: Dict[str, str],
     prompt: str,
@@ -265,7 +535,6 @@ def build_ltx25_workflow(
     first_frame_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Official ComfyUI v0.46.0 LTX-2.5 22B Distilled INT8 2-stage (x2 latent upscaler) AV workflow."""
-    # Final resolution multiple of 64 so stage-1 half-res is cleanly a multiple of 32
     full_w = _snap(width, 64, 512, 1280)
     full_h = _snap(height, 64, 384, 1280)
     half_w = full_w // 2
@@ -275,46 +544,16 @@ def build_ltx25_workflow(
     effective_neg = neg_prompt.strip() or "pc game, console game, video game, cartoon, childish, ugly, blurry, distorted face"
 
     wf: Dict[str, Any] = {
-        "1": {
-            "class_type": "UNETLoader",
-            "inputs": {"unet_name": detected["unet"], "weight_dtype": "default"},
-        },
-        "2": {
-            "class_type": "CLIPLoader",
-            "inputs": {"clip_name": detected["clip"], "type": "ltxv", "device": "default"},
-        },
-        "3": {
-            "class_type": "VAELoader",
-            "inputs": {"vae_name": detected["video_vae"]},
-        },
-        "4": {
-            "class_type": "VAELoader",
-            "inputs": {"vae_name": detected["audio_vae"]},
-        },
-        "5": {
-            "class_type": "LatentUpscaleModelLoader",
-            "inputs": {"model_name": detected["upscaler"]},
-        },
-        "6": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": prompt, "clip": ["2", 0]},
-        },
-        "7": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": effective_neg, "clip": ["2", 0]},
-        },
-        "8": {
-            "class_type": "LTXVConditioning",
-            "inputs": {"positive": ["6", 0], "negative": ["7", 0], "frame_rate": fps},
-        },
-        "9": {
-            "class_type": "EmptyLTXVLatentVideo",
-            "inputs": {"width": half_w, "height": half_h, "length": frames, "batch_size": 1},
-        },
-        "10": {
-            "class_type": "LTXVEmptyLatentAudio",
-            "inputs": {"frames_number": frames, "frame_rate": fps, "batch_size": 1, "audio_vae": ["4", 0]},
-        },
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": detected["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": detected["clip"], "type": "ltxv", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": detected["video_vae"]}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": detected["audio_vae"]}},
+        "5": {"class_type": "LatentUpscaleModelLoader", "inputs": {"model_name": detected["upscaler"]}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": effective_neg, "clip": ["2", 0]}},
+        "8": {"class_type": "LTXVConditioning", "inputs": {"positive": ["6", 0], "negative": ["7", 0], "frame_rate": fps}},
+        "9": {"class_type": "EmptyLTXVLatentVideo", "inputs": {"width": half_w, "height": half_h, "length": frames, "batch_size": 1}},
+        "10": {"class_type": "LTXVEmptyLatentAudio", "inputs": {"frames_number": frames, "frame_rate": fps, "batch_size": 1, "audio_vae": ["4", 0]}},
     }
 
     stage1_video_latent: Any = ["9", 0]
@@ -323,117 +562,50 @@ def build_ltx25_workflow(
         wf["12"] = {"class_type": "LTXVPreprocess", "inputs": {"image": ["11", 0], "img_compression": 18}}
         wf["13"] = {
             "class_type": "LTXVImgToVideoInplace",
-            "inputs": {
-                "vae": ["3", 0],
-                "image": ["12", 0],
-                "latent": ["9", 0],
-                "strength": 0.7,
-                "bypass": False,
-            },
+            "inputs": {"vae": ["3", 0], "image": ["12", 0], "latent": ["9", 0], "strength": 0.7, "bypass": False},
         }
         stage1_video_latent = ["13", 0]
 
-    # Stage 1 Distilled 8-step AV sampling
-    wf["14"] = {
-        "class_type": "LTXVConcatAVLatent",
-        "inputs": {"video_latent": stage1_video_latent, "audio_latent": ["10", 0]},
-    }
+    wf["14"] = {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": stage1_video_latent, "audio_latent": ["10", 0]}}
     wf["15"] = {
         "class_type": "LTXVDualCFGGuider",
-        "inputs": {
-            "model": ["1", 0],
-            "positive": ["8", 0],
-            "negative": ["8", 1],
-            "video_cfg": 1.0,
-            "audio_cfg": 1.0,
-        },
+        "inputs": {"model": ["1", 0], "positive": ["8", 0], "negative": ["8", 1], "video_cfg": 1.0, "audio_cfg": 1.0},
     }
     wf["16"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler_ancestral"}}
-    wf["17"] = {
-        "class_type": "ManualSigmas",
-        "inputs": {"sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"},
-    }
+    wf["17"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"}}
     wf["18"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}}
     wf["19"] = {
         "class_type": "SamplerCustomAdvanced",
-        "inputs": {
-            "noise": ["18", 0],
-            "guider": ["15", 0],
-            "sampler": ["16", 0],
-            "sigmas": ["17", 0],
-            "latent_image": ["14", 0],
-        },
+        "inputs": {"noise": ["18", 0], "guider": ["15", 0], "sampler": ["16", 0], "sigmas": ["17", 0], "latent_image": ["14", 0]},
     }
     wf["20"] = {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["19", 0]}}
+    wf["21"] = {"class_type": "LTXVLatentUpsampler", "inputs": {"samples": ["20", 0], "upscale_model": ["5", 0], "vae": ["3", 0]}}
 
-    # Stage 2 Spatial x2 Latent Upscale + 3-step Refinement
-    wf["21"] = {
-        "class_type": "LTXVLatentUpsampler",
-        "inputs": {"samples": ["20", 0], "upscale_model": ["5", 0], "vae": ["3", 0]},
-    }
     stage2_video_latent: Any = ["21", 0]
     if first_frame_name:
         wf["22"] = {
             "class_type": "LTXVImgToVideoInplace",
-            "inputs": {
-                "vae": ["3", 0],
-                "image": ["12", 0],
-                "latent": ["21", 0],
-                "strength": 1.0,
-                "bypass": False,
-            },
+            "inputs": {"vae": ["3", 0], "image": ["12", 0], "latent": ["21", 0], "strength": 1.0, "bypass": False},
         }
         stage2_video_latent = ["22", 0]
 
-    wf["23"] = {
-        "class_type": "LTXVConcatAVLatent",
-        "inputs": {"video_latent": stage2_video_latent, "audio_latent": ["20", 1]},
-    }
-    wf["24"] = {
-        "class_type": "ManualSigmas",
-        "inputs": {"sigmas": "0.85, 0.7250, 0.4219, 0.0"},
-    }
+    wf["23"] = {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": stage2_video_latent, "audio_latent": ["20", 1]}}
+    wf["24"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": "0.85, 0.7250, 0.4219, 0.0"}}
     wf["25"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": 42}}
     wf["26"] = {
         "class_type": "SamplerCustomAdvanced",
-        "inputs": {
-            "noise": ["25", 0],
-            "guider": ["15", 0],
-            "sampler": ["16", 0],
-            "sigmas": ["24", 0],
-            "latent_image": ["23", 0],
-        },
+        "inputs": {"noise": ["25", 0], "guider": ["15", 0], "sampler": ["16", 0], "sigmas": ["24", 0], "latent_image": ["23", 0]},
     }
     wf["27"] = {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["26", 0]}}
-
-    # Tiled Video Decode (8GB VRAM safe) + Audio Decode + SaveVideo MP4
     wf["28"] = {
         "class_type": "VAEDecodeTiled",
-        "inputs": {
-            "samples": ["27", 0],
-            "vae": ["3", 0],
-            "tile_size": 512,
-            "overlap": 64,
-            "temporal_size": 64,
-            "temporal_overlap": 16,
-        },
+        "inputs": {"samples": ["27", 0], "vae": ["3", 0], "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 16},
     }
-    wf["29"] = {
-        "class_type": "LTXVAudioVAEDecode",
-        "inputs": {"samples": ["27", 1], "audio_vae": ["4", 0]},
-    }
-    wf["30"] = {
-        "class_type": "CreateVideo",
-        "inputs": {"images": ["28", 0], "audio": ["29", 0], "fps": fps},
-    }
+    wf["29"] = {"class_type": "LTXVAudioVAEDecode", "inputs": {"samples": ["27", 1], "audio_vae": ["4", 0]}}
+    wf["30"] = {"class_type": "CreateVideo", "inputs": {"images": ["28", 0], "audio": ["29", 0], "fps": fps}}
     wf["31"] = {
         "class_type": "SaveVideo",
-        "inputs": {
-            "video": ["30", 0],
-            "filename_prefix": f"video/L3M_LTX25_{int(time.time())}",
-            "format": "auto",
-            "codec": "auto",
-        },
+        "inputs": {"video": ["30", 0], "filename_prefix": f"video/L3M_LTX25_{int(time.time())}", "format": "auto", "codec": "auto"},
     }
     return wf
 
@@ -453,51 +625,27 @@ def build_minimax_h3_workflow(
     """Official ComfyUI v0.46.0 MiniMax-H3 FL2VA INT8 AV workflow (optional 8-step Turbo LoRA)."""
     w = _snap(width, 32, 320, 1280)
     h = _snap(height, 32, 320, 1280)
-    # Official template frame snapping to 17k + 5 at 24fps (e.g. 5s -> 124 frames)
     raw = max(5, round(int(duration) * 24))
     length = raw + (5 - (raw % 17)) % 17
     length = max(22, min(243, length))
     effective_steps = max(4, min(40, int(steps or (8 if use_turbo else 20))))
 
     wf: Dict[str, Any] = {
-        "1": {
-            "class_type": "UNETLoader",
-            "inputs": {"unet_name": detected["unet"], "weight_dtype": "default"},
-        },
-        "2": {
-            "class_type": "CLIPLoader",
-            "inputs": {"clip_name": detected["clip"], "type": "minimax", "device": "default"},
-        },
-        "3": {
-            "class_type": "VAELoader",
-            "inputs": {"vae_name": detected["video_vae"]},
-        },
-        "4": {
-            "class_type": "VAELoader",
-            "inputs": {"vae_name": detected["audio_vae"]},
-        },
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": detected["unet"], "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": detected["clip"], "type": "minimax", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": detected["video_vae"]}},
+        "4": {"class_type": "VAELoader", "inputs": {"vae_name": detected["audio_vae"]}},
     }
 
     model_ref: Any = ["1", 0]
     if use_turbo and detected.get("turbo_lora"):
         wf["5"] = {
             "class_type": "LoraLoaderModelOnly",
-            "inputs": {
-                "model": ["1", 0],
-                "lora_name": detected["turbo_lora"],
-                "strength_model": 1.0,
-            },
+            "inputs": {"model": ["1", 0], "lora_name": detected["turbo_lora"], "strength_model": 1.0},
         }
         model_ref = ["5", 0]
 
-    mm_inputs: Dict[str, Any] = {
-        "clip": ["2", 0],
-        "vae": ["3", 0],
-        "prompt": prompt,
-        "width": w,
-        "height": h,
-        "length": length,
-    }
+    mm_inputs: Dict[str, Any] = {"clip": ["2", 0], "vae": ["3", 0], "prompt": prompt, "width": w, "height": h, "length": length}
     if first_frame_name:
         wf["6"] = {"class_type": "LoadImage", "inputs": {"image": first_frame_name}}
         mm_inputs["first_frame"] = ["6", 0]
@@ -509,102 +657,22 @@ def build_minimax_h3_workflow(
     wf["9"] = {"class_type": "BasicGuider", "inputs": {"model": model_ref, "conditioning": ["8", 0]}}
     wf["10"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": int(seed)}}
     wf["11"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}}
-    wf["12"] = {
-        "class_type": "BasicScheduler",
-        "inputs": {"model": model_ref, "scheduler": "simple", "steps": effective_steps, "denoise": 1.0},
-    }
+    wf["12"] = {"class_type": "BasicScheduler", "inputs": {"model": model_ref, "scheduler": "simple", "steps": effective_steps, "denoise": 1.0}}
     wf["13"] = {
         "class_type": "SamplerCustomAdvanced",
-        "inputs": {
-            "noise": ["10", 0],
-            "guider": ["9", 0],
-            "sampler": ["11", 0],
-            "sigmas": ["12", 0],
-            "latent_image": ["8", 1],
-        },
+        "inputs": {"noise": ["10", 0], "guider": ["9", 0], "sampler": ["11", 0], "sigmas": ["12", 0], "latent_image": ["8", 1]},
     }
     wf["14"] = {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["3", 0]}}
     wf["15"] = {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["13", 0], "vae": ["4", 0]}}
-    wf["16"] = {
-        "class_type": "CreateVideo",
-        "inputs": {"images": ["14", 0], "audio": ["15", 0], "fps": 24.0},
-    }
+    wf["16"] = {"class_type": "CreateVideo", "inputs": {"images": ["14", 0], "audio": ["15", 0], "fps": 24.0}}
     wf["17"] = {
         "class_type": "SaveVideo",
-        "inputs": {
-            "video": ["16", 0],
-            "filename_prefix": f"video/L3M_MiniMaxH3_{int(time.time())}",
-            "format": "auto",
-            "codec": "auto",
-        },
+        "inputs": {"video": ["16", 0], "filename_prefix": f"video/L3M_MiniMaxH3_{int(time.time())}", "format": "auto", "codec": "auto"},
     }
     return wf
 
 
-def prepare_custom_workflow(
-    raw_json: str,
-    prompt: str,
-    neg_prompt: str,
-    width: int,
-    height: int,
-    steps: int,
-    seed: int,
-    first_frame_name: Optional[str],
-    last_frame_name: Optional[str],
-) -> Dict[str, Any]:
-    """Load user-supplied ComfyUI API workflow JSON and inject prompt/seed/frames."""
-    try:
-        wf = json.loads(raw_json)
-    except Exception as exc:
-        raise ValueError(f"自訂 ComfyUI API JSON 解析失敗：{exc}")
-    if not isinstance(wf, dict) or ("nodes" in wf and "links" in wf):
-        raise ValueError("請上傳 ComfyUI「Export (API)」格式的 JSON（而非一般 UI 工作流 JSON）。")
-
-    serialized = json.dumps(wf, ensure_ascii=False)
-    had_placeholder = False
-    replacements = {
-        "{{PROMPT}}": prompt,
-        "{{NEGATIVE_PROMPT}}": neg_prompt,
-        "{{FIRST_FRAME}}": first_frame_name or "",
-        "{{LAST_FRAME}}": last_frame_name or "",
-    }
-    for token, val in replacements.items():
-        if token in serialized:
-            had_placeholder = True
-            serialized = serialized.replace(token, val.replace('"', '\\"'))
-    wf = json.loads(serialized)
-
-    if not had_placeholder:
-        wf = copy.deepcopy(wf)
-        prompt_set = False
-        img_nodes: List[str] = []
-        for nid, node in wf.items():
-            if not isinstance(node, dict):
-                continue
-            ctype = str(node.get("class_type", ""))
-            inputs = node.get("inputs", {})
-            if not isinstance(inputs, dict):
-                continue
-            if not prompt_set and ctype in ("MiniMaxH3ImageToVideo", "CLIPTextEncode"):
-                if "prompt" in inputs and isinstance(inputs["prompt"], str):
-                    inputs["prompt"] = prompt
-                    prompt_set = True
-                elif "text" in inputs and isinstance(inputs["text"], str):
-                    inputs["text"] = prompt
-                    prompt_set = True
-            if ctype == "LoadImage":
-                img_nodes.append(nid)
-            if "noise_seed" in inputs and isinstance(inputs["noise_seed"], int):
-                inputs["noise_seed"] = int(seed)
-            elif "seed" in inputs and isinstance(inputs["seed"], int):
-                inputs["seed"] = int(seed)
-            if ctype in ("BasicScheduler", "KSampler") and "steps" in inputs and isinstance(inputs["steps"], int):
-                inputs["steps"] = int(steps)
-        if first_frame_name and len(img_nodes) >= 1:
-            wf[img_nodes[0]]["inputs"]["image"] = first_frame_name
-        if last_frame_name and len(img_nodes) >= 2:
-            wf[img_nodes[1]]["inputs"]["image"] = last_frame_name
-    return wf
+# ---------- Shared ComfyUI Execution Helpers ----------
 
 
 async def _upload_image_to_comfyui(client: httpx.AsyncClient, base_url: str, img_path: Path) -> str:
@@ -628,30 +696,12 @@ async def _transcode_to_mp4(src: Path, dst: Path) -> Path:
     ffmpeg_bin = shutil.which("ffmpeg")
     if not ffmpeg_bin or src.suffix.lower() == ".mp4":
         return src
-    ff_kwargs: Dict[str, Any] = {
-        "stdout": asyncio.subprocess.PIPE,
-        "stderr": asyncio.subprocess.STDOUT,
-    }
+    ff_kwargs: Dict[str, Any] = {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.STDOUT}
     if platform.system() == "Windows":
         ff_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     proc = await asyncio.create_subprocess_exec(
-        ffmpeg_bin,
-        "-y",
-        "-i",
-        str(src),
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "18",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-movflags",
-        "+faststart",
-        str(dst),
+        ffmpeg_bin, "-y", "-i", str(src), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(dst),
         **ff_kwargs,
     )
     await proc.communicate()
@@ -659,6 +709,250 @@ async def _transcode_to_mp4(src: Path, dst: Path) -> Path:
         src.unlink(missing_ok=True)
         return dst
     return src
+
+
+async def _submit_and_wait_comfyui(
+    client: httpx.AsyncClient,
+    base_url: str,
+    workflow: Dict[str, Any],
+    model_label: str,
+    job: Dict[str, Any],
+    is_cancelled: Callable[[], bool],
+    on_prompt_submitted: Callable[[str, str], None],
+    est_scale_sec: float = 40.0,
+) -> Dict[str, Any]:
+    """Submit API prompt to ComfyUI, wait until completion or error, return history entry."""
+    client_id = f"l3m_{uuid.uuid4().hex[:10]}"
+    job["progress"] = 14
+    job["message"] = f"正在送出 {model_label} 工作流至 ComfyUI ({base_url})..."
+    submit_resp = await client.post(
+        f"{base_url}/prompt",
+        json={"prompt": workflow, "client_id": client_id},
+    )
+    if submit_resp.status_code != 200:
+        raise RuntimeError(f"ComfyUI 拒絕執行工作流 (HTTP {submit_resp.status_code})：{submit_resp.text[:500]}")
+    submit_data = submit_resp.json()
+    node_errors = submit_data.get("node_errors")
+    if node_errors:
+        raise RuntimeError(f"ComfyUI 節點參數驗證錯誤：{json.dumps(node_errors, ensure_ascii=False)[:450]}")
+    prompt_id = str(submit_data.get("prompt_id", ""))
+    if not prompt_id:
+        raise RuntimeError("ComfyUI 未回傳 prompt_id。")
+    on_prompt_submitted(base_url, prompt_id)
+
+    t_start = time.monotonic()
+    while True:
+        if is_cancelled():
+            await interrupt_comfyui(base_url, prompt_id)
+            raise asyncio.CancelledError()
+
+        await asyncio.sleep(1.2)
+        elapsed = int(time.monotonic() - t_start)
+
+        hr = await client.get(f"{base_url}/history/{prompt_id}")
+        if hr.status_code == 200:
+            hdata = hr.json()
+            if prompt_id in hdata:
+                hist_entry = hdata[prompt_id]
+                status_obj = hist_entry.get("status", {})
+                status_str = str(status_obj.get("status_str", ""))
+                if status_str == "error":
+                    msgs = status_obj.get("messages", [])
+                    raise RuntimeError(f"ComfyUI 執行發生錯誤：{json.dumps(msgs, ensure_ascii=False)[:450]}")
+                if status_obj.get("completed") or hist_entry.get("outputs"):
+                    return hist_entry
+
+        try:
+            qr = await client.get(f"{base_url}/queue")
+            if qr.status_code == 200:
+                qdata = qr.json()
+                running_ids = [item[1] for item in qdata.get("queue_running", []) if len(item) > 1]
+                pending_ids = [item[1] for item in qdata.get("queue_pending", []) if len(item) > 1]
+                if prompt_id in pending_ids:
+                    pos = pending_ids.index(prompt_id) + 1
+                    job["progress"] = 16
+                    job["message"] = f"ComfyUI 佇列排隊中（第 {pos} 順位 · 已等待 {elapsed}s）..."
+                elif prompt_id in running_ids:
+                    est_pct = min(92, int(20 + 72 * (1.0 - (1.0 / (1.0 + elapsed / est_scale_sec)))))
+                    job["progress"] = max(job.get("progress", 20), est_pct)
+                    job["message"] = f"ComfyUI GPU 渲染中（{model_label} · 已耗時 {elapsed}s）..."
+                elif elapsed > 12:
+                    job["message"] = f"正在同步 ComfyUI 輸出結果（{elapsed}s）..."
+        except Exception:
+            pass
+
+
+async def _prepare_loaded_or_custom_workflow(
+    base_url: str,
+    raw_wf: Dict[str, Any],
+    prompt: str,
+    neg_prompt: str,
+    width: Optional[int],
+    height: Optional[int],
+    batch_size: Optional[int],
+    steps: Optional[int],
+    seed: int,
+    first_frame_name: Optional[str],
+    last_frame_name: Optional[str],
+) -> Dict[str, Any]:
+    if isinstance(raw_wf.get("nodes"), list):
+        obj_info = await get_comfy_object_info(base_url)
+        api_wf = convert_ui_workflow_to_api(raw_wf, obj_info)
+    else:
+        api_wf = raw_wf
+    return inject_workflow_params(
+        api_wf,
+        prompt=prompt,
+        neg_prompt=neg_prompt,
+        width=width,
+        height=height,
+        batch_size=batch_size,
+        steps=steps,
+        seed=seed,
+        first_frame_name=first_frame_name,
+        last_frame_name=last_frame_name,
+    )
+
+
+# ---------- Run ComfyUI Image Generation ----------
+
+
+async def run_comfyui_image(
+    job: Dict[str, Any],
+    params: Dict[str, Any],
+    images_dir: Path,
+    ref_image_path: Optional[Path],
+    is_cancelled: Callable[[], bool],
+    on_prompt_submitted: Callable[[str, str], None],
+) -> Tuple[List[Path], Dict[str, Any]]:
+    """Run image generation on local ComfyUI (Z-Image-Turbo / Checkpoint / Auto-Loaded Workflow / Custom JSON)."""
+    status = await probe_comfyui(force=True)
+    if not status["online"]:
+        raise RuntimeError(
+            f"無法連線至 ComfyUI（{status['url']}）。請確認 ComfyUI 已在背景啟動，或於「設定」檢查 ComfyUI 伺服器網址。"
+        )
+
+    base_url = status["url"].rstrip("/")
+    preset_id = str(params.get("comfy_preset") or "comfy_z_image_turbo")
+    prompt = str(params.get("prompt", "")).strip()
+    neg_prompt = str(params.get("negative_prompt", "")).strip()
+    width = int(params.get("width", 1024))
+    height = int(params.get("height", 1024))
+    steps = int(params.get("steps", 8))
+    batch_count = max(1, min(4, int(params.get("batch_count", 1))))
+    raw_seed = params.get("seed")
+    seed = int(raw_seed) if (raw_seed is not None and str(raw_seed).strip() != "") else random.randint(1, 2147483647)
+    lora_name = str(params.get("comfy_lora_name") or "").strip()
+    lora_strength = float(params.get("lora_strength", 0.8) or 0.8)
+    ckpt_name = str(params.get("comfy_checkpoint") or "").strip()
+    detected = status["detected"]
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        ref_name: Optional[str] = None
+        if ref_image_path and ref_image_path.exists():
+            job["progress"] = 8
+            job["message"] = "正在上傳參考圖片至 ComfyUI..."
+            ref_name = await _upload_image_to_comfyui(client, base_url, ref_image_path)
+
+        if is_cancelled():
+            raise asyncio.CancelledError()
+
+        if preset_id == "comfy_saved_workflow":
+            wf_id = str(params.get("comfy_workflow_id") or "").strip()
+            if not wf_id:
+                raise ValueError("請先從下拉選單選擇一個已安裝的 ComfyUI 工作流。")
+            job["progress"] = 10
+            job["message"] = "正在載入並轉換 ComfyUI 工作流..."
+            raw_wf, wf_name = await fetch_comfyui_workflow_raw(base_url, wf_id)
+            workflow = await _prepare_loaded_or_custom_workflow(
+                base_url, raw_wf, prompt, neg_prompt, width, height, batch_count, steps, seed, ref_name, None
+            )
+            model_meta = {"id": f"comfy_wf:{wf_id}", "name": f"ComfyUI 工作流 · {wf_name}", "quantization": "Workflow"}
+        elif preset_id == "comfy_custom_json":
+            raw_str = str(params.get("comfy_workflow_json") or "").strip()
+            if not raw_str:
+                raise ValueError("請先上傳或貼上 ComfyUI JSON 工作流。")
+            raw_wf = json.loads(raw_str)
+            workflow = await _prepare_loaded_or_custom_workflow(
+                base_url, raw_wf, prompt, neg_prompt, width, height, batch_count, steps, seed, ref_name, None
+            )
+            model_meta = {"id": "comfy_custom_json", "name": "ComfyUI 自訂工作流", "quantization": "JSON"}
+        elif preset_id == "comfy_checkpoint":
+            if not ckpt_name:
+                ckpts = status.get("checkpoints") or []
+                if not ckpts:
+                    raise RuntimeError("ComfyUI 尚未安裝任何 Checkpoint 底模。")
+                ckpt_name = ckpts[0]
+            workflow = build_checkpoint_image_workflow(
+                ckpt_name, prompt, neg_prompt, width, height, steps, batch_count, seed,
+                cfg=float(params.get("cfg_scale", 7.0) or 7.0),
+                lora_name=lora_name, lora_strength=lora_strength, ref_image_name=ref_name,
+            )
+            short_ckpt = Path(ckpt_name).stem
+            model_meta = {"id": f"comfy_ckpt:{ckpt_name}", "name": f"ComfyUI · {short_ckpt}", "quantization": "Ckpt"}
+        else:
+            if detected.get("has_z_image"):
+                workflow = build_z_image_turbo_workflow(
+                    detected["z_image"], prompt, width, height, steps, batch_count, seed,
+                    lora_name=lora_name, lora_strength=lora_strength, ref_image_name=ref_name,
+                )
+                model_meta = {"id": "comfy_z_image_turbo", "name": "ComfyUI · Z-Image-Turbo", "quantization": "BF16"}
+            elif status.get("checkpoints"):
+                ck = ckpt_name or status["checkpoints"][0]
+                workflow = build_checkpoint_image_workflow(
+                    ck, prompt, neg_prompt, width, height, steps, batch_count, seed,
+                    lora_name=lora_name, lora_strength=lora_strength, ref_image_name=ref_name,
+                )
+                model_meta = {"id": f"comfy_ckpt:{ck}", "name": f"ComfyUI · {Path(ck).stem}", "quantization": "Ckpt"}
+            else:
+                raise RuntimeError("ComfyUI 中未偵測到圖片生成模型，請選擇「已安裝工作流」或檢查模型目錄。")
+
+        hist_entry = await _submit_and_wait_comfyui(
+            client, base_url, workflow, model_meta["name"], job, is_cancelled, on_prompt_submitted, est_scale_sec=20.0
+        )
+
+        # Collect generated images (preferring 'output' saved images over intermediate 'temp' previews)
+        outputs = hist_entry.get("outputs", {})
+        saved_imgs: List[Dict[str, Any]] = []
+        temp_imgs: List[Dict[str, Any]] = []
+        for _nid, node_out in outputs.items():
+            if not isinstance(node_out, dict):
+                continue
+            for item in node_out.get("images") or []:
+                fn = str(item.get("filename", ""))
+                if not fn or fn.lower().endswith((".mp4", ".webm", ".mov", ".avi")):
+                    continue
+                if item.get("type", "output") == "output":
+                    saved_imgs.append(item)
+                else:
+                    temp_imgs.append(item)
+
+        chosen_imgs = saved_imgs or temp_imgs
+        if not chosen_imgs:
+            raise RuntimeError("ComfyUI 工作流已執行完畢，但未在節點輸出中找到圖片（請確認包含 SaveImage 或 PreviewImage 節點）。")
+
+        job["progress"] = 95
+        job["message"] = f"正在從 ComfyUI 下載 {len(chosen_imgs)} 張高品質成品圖片..."
+        out_paths: List[Path] = []
+        for idx, info in enumerate(chosen_imgs):
+            view_resp = await client.get(
+                f"{base_url}/view",
+                params={
+                    "filename": info["filename"],
+                    "subfolder": info.get("subfolder", ""),
+                    "type": info.get("type", "output"),
+                },
+            )
+            view_resp.raise_for_status()
+            ext = Path(info["filename"]).suffix.lower() or ".png"
+            out_path = images_dir / f"comfy_{int(time.time())}_{job['id']}_{idx}{ext}"
+            out_path.write_bytes(view_resp.content)
+            out_paths.append(out_path)
+
+        return out_paths, model_meta
+
+
+# ---------- Run ComfyUI Video Generation ----------
 
 
 async def run_comfyui_video(
@@ -687,9 +981,7 @@ async def run_comfyui_video(
     steps = int(params.get("steps", 8))
     raw_seed = params.get("seed")
     seed = int(raw_seed) if (raw_seed is not None and str(raw_seed).strip() != "") else random.randint(1, 2147483647)
-
     detected = status["detected"]
-    client_id = f"l3m_{uuid.uuid4().hex[:10]}"
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         ff_name: Optional[str] = None
@@ -706,45 +998,45 @@ async def run_comfyui_video(
         if is_cancelled():
             raise asyncio.CancelledError()
 
-        if preset_id == "comfy_custom_json":
+        if preset_id == "comfy_saved_workflow":
+            wf_id = str(params.get("comfy_workflow_id") or "").strip()
+            if not wf_id:
+                raise ValueError("請先從下拉選單選擇一個已安裝的 ComfyUI 工作流。")
+            job["progress"] = 12
+            job["message"] = "正在載入並轉換 ComfyUI 影片工作流..."
+            raw_wf, wf_name = await fetch_comfyui_workflow_raw(base_url, wf_id)
+            workflow = await _prepare_loaded_or_custom_workflow(
+                base_url, raw_wf, prompt, neg_prompt, width, height, 1, steps, seed, ff_name, lf_name
+            )
+            model_meta = {"id": f"comfy_wf:{wf_id}", "name": f"ComfyUI 工作流 · {wf_name}", "quantization": "Workflow"}
+        elif preset_id == "comfy_custom_json":
             custom_json = str(params.get("comfy_workflow_json") or "").strip()
             if not custom_json:
-                raise ValueError("請先上傳或貼上 ComfyUI API 格式的 JSON 工作流檔案。")
-            workflow = prepare_custom_workflow(
-                custom_json, prompt, neg_prompt, width, height, steps, seed, ff_name, lf_name
+                raise ValueError("請先上傳或貼上 ComfyUI JSON 工作流檔案。")
+            raw_wf = json.loads(custom_json)
+            workflow = await _prepare_loaded_or_custom_workflow(
+                base_url, raw_wf, prompt, neg_prompt, width, height, 1, steps, seed, ff_name, lf_name
             )
-            model_meta = {"id": "comfy_custom_json", "name": "ComfyUI 自訂工作流", "quantization": "API"}
+            model_meta = {"id": "comfy_custom_json", "name": "ComfyUI 自訂工作流", "quantization": "JSON"}
         elif preset_id == "comfy_ltx25":
             if not detected.get("has_ltx25"):
                 raise RuntimeError("ComfyUI 尚未安裝完整 LTX-2.5 權重（需要 UNET + Gemma4 CLIP + Video/Audio VAE + x2 Upscaler）。")
-            workflow = build_ltx25_workflow(
-                detected["ltx25"], prompt, neg_prompt, width, height, duration, seed, ff_name
-            )
+            workflow = build_ltx25_workflow(detected["ltx25"], prompt, neg_prompt, width, height, duration, seed, ff_name)
             model_meta = {"id": "comfy_ltx25", "name": "ComfyUI · LTX-2.5 22B Distilled", "quantization": "INT8"}
         elif preset_id in ("comfy_minimax_h3_turbo", "comfy_minimax_h3"):
             if not detected.get("has_minimax_h3"):
                 raise RuntimeError("ComfyUI 尚未安裝完整 MiniMax-H3 權重（需要 UNET + Qwen3VL CLIP + Video/Audio VAE）。")
             use_turbo = preset_id == "comfy_minimax_h3_turbo" and bool(detected.get("has_minimax_turbo_lora"))
             workflow = build_minimax_h3_workflow(
-                detected["minimax_h3"],
-                prompt,
-                width,
-                height,
-                duration,
-                steps if steps else (8 if use_turbo else 20),
-                seed,
-                use_turbo=use_turbo,
-                first_frame_name=ff_name,
-                last_frame_name=lf_name,
+                detected["minimax_h3"], prompt, width, height, duration,
+                steps if steps else (8 if use_turbo else 20), seed,
+                use_turbo=use_turbo, first_frame_name=ff_name, last_frame_name=lf_name,
             )
             label = "INT8 · 8步Turbo" if use_turbo else "INT8 · 20步"
             model_meta = {"id": preset_id, "name": "ComfyUI · MiniMax-H3 FL2VA", "quantization": label}
         else:
-            # Fallback to first available preset
             if detected.get("has_ltx25"):
-                workflow = build_ltx25_workflow(
-                    detected["ltx25"], prompt, neg_prompt, width, height, duration, seed, ff_name
-                )
+                workflow = build_ltx25_workflow(detected["ltx25"], prompt, neg_prompt, width, height, duration, seed, ff_name)
                 model_meta = {"id": "comfy_ltx25", "name": "ComfyUI · LTX-2.5 22B Distilled", "quantization": "INT8"}
             elif detected.get("has_minimax_h3"):
                 use_turbo = bool(detected.get("has_minimax_turbo_lora"))
@@ -753,75 +1045,13 @@ async def run_comfyui_video(
                 )
                 model_meta = {"id": "comfy_minimax_h3_turbo", "name": "ComfyUI · MiniMax-H3 FL2VA", "quantization": "INT8"}
             else:
-                raise RuntimeError("ComfyUI 中未偵測到 LTX-2.5 或 MiniMax-H3 影片權重，請使用「自訂 API JSON」或檢查模型目錄。")
+                raise RuntimeError("ComfyUI 中未偵測到 LTX-2.5 或 MiniMax-H3 影片權重，請使用「已安裝工作流」或檢查模型目錄。")
 
-        job["progress"] = 14
-        job["message"] = f"正在送出 {model_meta['name']} 工作流至 ComfyUI ({base_url})..."
-        submit_resp = await client.post(
-            f"{base_url}/prompt",
-            json={"prompt": workflow, "client_id": client_id},
+        hist_entry = await _submit_and_wait_comfyui(
+            client, base_url, workflow, model_meta["name"], job, is_cancelled, on_prompt_submitted, est_scale_sec=75.0
         )
-        if submit_resp.status_code != 200:
-            err_body = submit_resp.text[:500]
-            raise RuntimeError(f"ComfyUI 拒絕執行工作流 (HTTP {submit_resp.status_code})：{err_body}")
-        submit_data = submit_resp.json()
-        node_errors = submit_data.get("node_errors")
-        if node_errors:
-            raise RuntimeError(f"ComfyUI 節點參數驗證錯誤：{json.dumps(node_errors, ensure_ascii=False)[:400]}")
-        prompt_id = str(submit_data.get("prompt_id", ""))
-        if not prompt_id:
-            raise RuntimeError("ComfyUI 未回傳 prompt_id。")
-        on_prompt_submitted(base_url, prompt_id)
 
-        # Poll ComfyUI queue + history until completed
-        t_start = time.monotonic()
-        hist_entry: Optional[Dict[str, Any]] = None
-        while True:
-            if is_cancelled():
-                await interrupt_comfyui(base_url, prompt_id)
-                raise asyncio.CancelledError()
-
-            await asyncio.sleep(1.5)
-            elapsed = int(time.monotonic() - t_start)
-
-            hr = await client.get(f"{base_url}/history/{prompt_id}")
-            if hr.status_code == 200:
-                hdata = hr.json()
-                if prompt_id in hdata:
-                    hist_entry = hdata[prompt_id]
-                    status_obj = hist_entry.get("status", {})
-                    status_str = str(status_obj.get("status_str", ""))
-                    if status_str == "error":
-                        msgs = status_obj.get("messages", [])
-                        err_detail = json.dumps(msgs, ensure_ascii=False)[:400]
-                        raise RuntimeError(f"ComfyUI 執行發生錯誤：{err_detail}")
-                    if status_obj.get("completed") or hist_entry.get("outputs"):
-                        break
-
-            # Inspect queue to show whether we are pending or actively running
-            try:
-                qr = await client.get(f"{base_url}/queue")
-                if qr.status_code == 200:
-                    qdata = qr.json()
-                    running_ids = [item[1] for item in qdata.get("queue_running", []) if len(item) > 1]
-                    pending_ids = [item[1] for item in qdata.get("queue_pending", []) if len(item) > 1]
-                    if prompt_id in pending_ids:
-                        pos = pending_ids.index(prompt_id) + 1
-                        job["progress"] = 16
-                        job["message"] = f"ComfyUI 佇列排隊中（第 {pos} 順位 · 已等待 {elapsed}s）..."
-                    elif prompt_id in running_ids:
-                        # Smooth asymptotic progress indicator while ComfyUI renders on GPU
-                        est_pct = min(92, int(20 + 72 * (1.0 - (1.0 / (1.0 + elapsed / 75.0)))))
-                        job["progress"] = max(job.get("progress", 20), est_pct)
-                        job["message"] = f"ComfyUI GPU 渲染中（{model_meta['name']} · 已耗時 {elapsed}s）..."
-                    elif elapsed > 12:
-                        # Not in queue and not in history yet — check once more next iteration
-                        job["message"] = f"正在同步 ComfyUI 輸出結果（{elapsed}s）..."
-            except Exception:
-                pass
-
-        # Extract saved video output from history
-        outputs = (hist_entry or {}).get("outputs", {})
+        outputs = hist_entry.get("outputs", {})
         video_file_info: Optional[Dict[str, Any]] = None
         for _nid, node_out in outputs.items():
             if not isinstance(node_out, dict):
@@ -848,11 +1078,13 @@ async def run_comfyui_video(
         job["progress"] = 95
         job["message"] = "正在從 ComfyUI 下載高品質成品影片..."
         fname = video_file_info["filename"]
-        sub = video_file_info.get("subfolder", "")
-        ftype = video_file_info.get("type", "output")
         view_resp = await client.get(
             f"{base_url}/view",
-            params={"filename": fname, "subfolder": sub, "type": ftype},
+            params={
+                "filename": fname,
+                "subfolder": video_file_info.get("subfolder", ""),
+                "type": video_file_info.get("type", "output"),
+            },
         )
         view_resp.raise_for_status()
 
@@ -868,6 +1100,9 @@ async def run_comfyui_video(
             final_path = await _transcode_to_mp4(raw_path, videos_dir / f"{base_stem}.mp4")
 
         return final_path, model_meta
+
+
+# ---------- Jimeng / Volcengine Ark Seedance Cloud Video API ----------
 
 
 async def run_jimeng_video(
@@ -918,10 +1153,7 @@ async def run_jimeng_video(
     if raw_seed is not None and str(raw_seed).strip() != "":
         payload["seed"] = int(raw_seed)
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
         job["progress"] = 10

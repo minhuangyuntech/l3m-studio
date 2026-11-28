@@ -279,6 +279,20 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
             />
           </div>
           <div>
+            <label className="block font-semibold text-slateink-muted mb-1">預設畫圖生成後台</label>
+            <select
+              value={form.image_backend || 'comfyui'}
+              onChange={(e) =>
+                setForm({ ...form, image_backend: e.target.value as 'comfyui' | 'sd_cli' | 'custom_api' })
+              }
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-semibold"
+            >
+              <option value="comfyui">ComfyUI 本機後台（推薦 · BF16 / SDXL / 工作流）</option>
+              <option value="sd_cli">本機 sd-cli（輕量 GGUF）</option>
+              <option value="custom_api">自訂繪圖 API（OpenAI 相容）</option>
+            </select>
+          </div>
+          <div>
             <label className="block font-semibold text-slateink-muted mb-1">預設影片生成後台</label>
             <select
               value={form.video_backend || 'comfyui'}
@@ -326,7 +340,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
                   連線成功：ComfyUI v{comfyResult.version || 'OK'} · {comfyResult.gpu_name || 'GPU Ready'}（{comfyResult.url}）
                 </div>
                 <div className="text-[11px] opacity-90">
-                  已偵測影片管線：
+                  畫圖管線：{comfyResult.detected?.has_z_image ? 'Z-Image-Turbo BF16 ✓' : ''}
+                  {comfyResult.checkpoints?.length ? ` · Checkpoints ${comfyResult.checkpoints.length} 個 ✓` : ''}
+                  {' · '}自動載入工作流：{comfyResult.workflows?.length ?? 0} 個
+                </div>
+                <div className="text-[11px] opacity-90">
+                  影片管線：
                   {comfyResult.detected?.has_ltx25 ? ' LTX-2.5 22B INT8 ✓' : ''}
                   {comfyResult.detected?.has_minimax_h3 ? ' · MiniMax-H3 FL2VA INT8 ✓' : ''}
                   {comfyResult.detected?.has_minimax_turbo_lora ? ' · MiniMax 8步 Turbo LoRA ✓' : ''}

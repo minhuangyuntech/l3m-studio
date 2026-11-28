@@ -21,7 +21,7 @@ from .config import APP_HOME, ENGINES_DIR, config_manager
 from .engine import engine_manager
 from .hardware import get_hardware_info
 from .models import scan_local_models
-from .video_backends import interrupt_comfyui, probe_comfyui, run_comfyui_video, run_jimeng_video
+from .video_backends import interrupt_comfyui, probe_comfyui, run_comfyui_image, run_comfyui_video, run_jimeng_video
 
 OUTPUTS_DIR = APP_HOME / "outputs"
 IMAGES_DIR = OUTPUTS_DIR / "images"
@@ -217,6 +217,7 @@ class MediaManager:
         comfy_status = await probe_comfyui()
         data["comfyui_status"] = comfy_status
         data["engines"]["comfyui_url"] = comfy_status.get("url") or config_manager.config.comfyui_url
+        data["engines"]["image_backend"] = config_manager.config.image_backend
         data["engines"]["video_backend"] = config_manager.config.video_backend
         data["engines"]["jimeng_configured"] = bool(config_manager.config.jimeng_api_key.strip())
         data["engines"]["jimeng_api_base"] = config_manager.config.jimeng_api_base
@@ -418,7 +419,10 @@ class MediaManager:
     async def _run_image_job(self, job: Dict[str, Any], params: Dict[str, Any]) -> None:
         t0 = time.monotonic()
         try:
-            if params.get("auto_unload_llm", True) and (
+            image_backend = str(params.get("image_backend") or config_manager.config.image_backend or "comfyui").lower()
+            custom_api = config_manager.config.custom_image_api.strip()
+
+            if image_backend != "custom_api" and params.get("auto_unload_llm", True) and (
                 engine_manager.status in ("running", "starting")
                 or engine_manager.find_external_llama_servers()
             ):
@@ -426,14 +430,34 @@ class MediaManager:
                 await engine_manager.stop_all_llama_servers()
                 await asyncio.sleep(1.0)
 
+            ref_path: Optional[Path] = None
+            if params.get("ref_image_data_url"):
+                ref_path = _save_base64_upload(params["ref_image_data_url"], "ref")
+
+            if image_backend == "comfyui":
+                out_paths, model_meta = await run_comfyui_image(
+                    job=job,
+                    params=params,
+                    images_dir=IMAGES_DIR,
+                    ref_image_path=ref_path,
+                    is_cancelled=lambda: job["id"] in self._cancelled_jobs,
+                    on_prompt_submitted=lambda u, pid: self._job_comfy_prompts.__setitem__(job["id"], (u, pid)),
+                )
+                for p in out_paths:
+                    self._register_output(job, model_meta, p, "image", params, time.monotonic() - t0)
+                job["status"] = "completed"
+                job["progress"] = 100
+                job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
+                job["message"] = f"ComfyUI 生成完成（共 {len(out_paths)} 張 · 耗時 {job['elapsed_seconds']}s）"
+                return
+
             all_models = scan_local_models()
             model = next((m for m in all_models if m["id"] == params.get("model_id")), None)
-            if not model:
+            if not model and image_backend != "custom_api":
                 raise ValueError("找不到選定的畫圖模型")
 
-            comps = _resolve_media_components(model)
+            comps = _resolve_media_components(model) if model else {}
             sd_cli = _discover_sd_cli()
-            custom_api = config_manager.config.custom_image_api.strip()
             count = max(1, min(int(params.get("batch_count", 1)), 4))
             width = int(params.get("width", 1024))
             height = int(params.get("height", 1024))
@@ -442,17 +466,15 @@ class MediaManager:
             prompt = str(params.get("prompt", "")).strip()
             neg_prompt = str(params.get("negative_prompt", "")).strip()
 
-            ref_path: Optional[Path] = None
-            if params.get("ref_image_data_url"):
-                ref_path = _save_base64_upload(params["ref_image_data_url"], "ref")
-
-            if custom_api:
+            if image_backend == "custom_api" or (custom_api and not sd_cli):
+                if not custom_api:
+                    raise RuntimeError("尚未在「設定」填寫自訂 OpenAI 相容繪圖 API 網址。")
                 job["message"] = f"透過外部繪圖服務 ({custom_api}) 生成中..."
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     resp = await client.post(
                         f"{custom_api.rstrip('/')}/images/generations",
                         json={
-                            "model": model["name"],
+                            "model": (model["name"] if model else "default"),
                             "prompt": prompt,
                             "n": count,
                             "size": f"{width}x{height}",
@@ -461,6 +483,7 @@ class MediaManager:
                     )
                     resp.raise_for_status()
                     data = resp.json()
+                    fallback_model = model or {"id": "custom_api", "name": "自訂繪圖 API", "quantization": "API"}
                     for idx, item in enumerate(data.get("data", [])):
                         out_name = f"img_{int(time.time())}_{job['id']}_{idx}.png"
                         out_path = IMAGES_DIR / out_name
@@ -469,7 +492,7 @@ class MediaManager:
                         elif item.get("url"):
                             img_r = await client.get(item["url"])
                             out_path.write_bytes(img_r.content)
-                        self._register_output(job, model, out_path, "image", params, time.monotonic() - t0)
+                        self._register_output(job, fallback_model, out_path, "image", params, time.monotonic() - t0)
             elif sd_cli:
                 for idx in range(count):
                     if job["id"] in self._cancelled_jobs:
@@ -545,7 +568,7 @@ class MediaManager:
             job["progress"] = 100
             job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
             job["message"] = f"生成完成（耗時 {job['elapsed_seconds']}s）"
-        except JobCancelledError:
+        except (JobCancelledError, asyncio.CancelledError):
             job["status"] = "cancelled"
             job["elapsed_seconds"] = round(time.monotonic() - t0, 1)
             job["message"] = f"已強制取消作業（已執行 {job['elapsed_seconds']}s）"
@@ -562,6 +585,7 @@ class MediaManager:
                 job["message"] = f"生成失敗：{exc}"
         finally:
             self._job_procs.pop(job["id"], None)
+            self._job_comfy_prompts.pop(job["id"], None)
             self._cancelled_jobs.discard(job["id"])
 
     def start_video_generation(self, params: Dict[str, Any]) -> Dict[str, Any]:

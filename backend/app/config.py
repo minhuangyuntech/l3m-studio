@@ -119,6 +119,7 @@ class AppConfig(BaseModel):
     sd_cli_path: str = ""
     comfyui_url: str = Field(default_factory=_discover_comfyui_url)
     custom_image_api: str = ""
+    image_backend: str = "comfyui"  # comfyui | sd_cli | custom_api
     video_backend: str = "comfyui"  # comfyui | jimeng | sd_cli
     jimeng_api_base: str = "https://ark.cn-beijing.volces.com/api/v3"
     jimeng_api_key: str = ""

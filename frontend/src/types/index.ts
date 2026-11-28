@@ -194,6 +194,7 @@ export interface AppSettings {
   sd_cli_path: string;
   comfyui_url: string;
   custom_image_api: string;
+  image_backend: 'comfyui' | 'sd_cli' | 'custom_api';
   video_backend: 'comfyui' | 'jimeng' | 'sd_cli';
   jimeng_api_base: string;
   jimeng_api_key: string;
@@ -245,25 +246,52 @@ export interface ComfyUIPreset {
   badge: string;
 }
 
+export interface ComfyUIImagePreset {
+  id: string;
+  name: string;
+  description: string;
+  default_steps: number;
+  badge: string;
+}
+
+export interface ComfyUIWorkflowSummary {
+  id: string;
+  name: string;
+  title: string;
+  source: 'user' | 'extension' | 'template';
+  source_label: string;
+  kind: 'image' | 'video' | 'other';
+  node_count: number;
+  models_ready: boolean;
+  description: string;
+  modified: number;
+}
+
 export interface ComfyUIStatus {
   online: boolean;
   url: string;
   version: string;
   gpu_name: string;
   error: string;
+  checkpoints?: string[];
   unets: string[];
   clips: string[];
   vaes: string[];
   upscalers: string[];
   loras: string[];
   detected: {
+    has_z_image?: boolean;
+    has_checkpoints?: boolean;
     has_ltx25?: boolean;
     has_minimax_h3?: boolean;
     has_minimax_turbo_lora?: boolean;
+    z_image?: Record<string, string>;
     ltx25?: Record<string, string>;
     minimax_h3?: Record<string, string>;
   };
   presets: ComfyUIPreset[];
+  image_presets?: ComfyUIImagePreset[];
+  workflows?: ComfyUIWorkflowSummary[];
 }
 
 export interface MediaModelsResponse {
@@ -285,6 +313,7 @@ export interface MediaModelsResponse {
     };
     comfyui_url: string;
     custom_image_api: string;
+    image_backend?: 'comfyui' | 'sd_cli' | 'custom_api';
     video_backend?: 'comfyui' | 'jimeng' | 'sd_cli';
     jimeng_configured?: boolean;
     jimeng_api_base?: string;

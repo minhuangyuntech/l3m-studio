@@ -77,6 +77,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   const [videoBackend, setVideoBackend] = useState<'comfyui' | 'jimeng' | 'sd_cli'>('comfyui');
   const backendInitRef = useRef(false);
   const [comfyPreset, setComfyPreset] = useState('comfy_ltx25');
+  const [comfyWorkflowId, setComfyWorkflowId] = useState('');
   const [customWorkflowJson, setCustomWorkflowJson] = useState('');
   const [customWorkflowName, setCustomWorkflowName] = useState('');
   const [probingComfy, setProbingComfy] = useState(false);
@@ -197,6 +198,10 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       if (presets.length > 0) {
         setComfyPreset((prev) => (prev && presets.some((p) => p.id === prev) ? prev : presets[0].id));
       }
+      const wfs = (m.comfyui_status?.workflows || []).filter((w) => w.kind === 'video' || w.source === 'user');
+      if (wfs.length > 0) {
+        setComfyWorkflowId((prev) => (prev && wfs.some((w) => w.id === prev) ? prev : wfs[0].id));
+      }
 
       if (m.video_models.length > 0) {
         const wan = m.video_models.find((x) => x.filename.toLowerCase().includes('wan2.2'));
@@ -260,6 +265,10 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   };
 
   const activeComfyPreset = mediaInfo?.comfyui_status?.presets?.find((p) => p.id === comfyPreset);
+  const videoWorkflows = useMemo(() => {
+    const all = mediaInfo?.comfyui_status?.workflows || [];
+    return all.filter((w) => w.kind === 'video' || w.source === 'user');
+  }, [mediaInfo]);
 
   const handleGenerateVideo = async () => {
     if (!prompt.trim()) return;
@@ -268,8 +277,12 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       setNotice('ComfyUI 尚未連線，請先確認 ComfyUI 已在背景執行並點擊「重新偵測」。');
       return;
     }
+    if (videoBackend === 'comfyui' && comfyPreset === 'comfy_saved_workflow' && !comfyWorkflowId) {
+      setNotice('請先選擇一個已自動載入的 ComfyUI 影片工作流。');
+      return;
+    }
     if (videoBackend === 'comfyui' && comfyPreset === 'comfy_custom_json' && !customWorkflowJson.trim()) {
-      setNotice('請先上傳或貼上 ComfyUI API 格式的 JSON 工作流。');
+      setNotice('請先上傳或貼上 ComfyUI JSON 工作流。');
       return;
     }
     if (videoBackend === 'jimeng' && !mediaInfo?.engines.jimeng_configured) {
@@ -282,6 +295,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       await api.generateVideo({
         video_backend: videoBackend,
         comfy_preset: comfyPreset,
+        comfy_workflow_id: comfyPreset === 'comfy_saved_workflow' ? comfyWorkflowId : undefined,
         comfy_workflow_json: comfyPreset === 'comfy_custom_json' ? customWorkflowJson : undefined,
         jimeng_model: jimengModel.trim() || undefined,
         ratio: videoBackend === 'jimeng' ? jimengRatio : sizePreset,
@@ -338,7 +352,11 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   };
 
   const handleReuse = (item: MediaGalleryItem) => {
-    if (item.model_id.startsWith('comfy_')) {
+    if (item.model_id.startsWith('comfy_wf:')) {
+      setVideoBackend('comfyui');
+      setComfyPreset('comfy_saved_workflow');
+      setComfyWorkflowId(item.model_id.replace('comfy_wf:', ''));
+    } else if (item.model_id.startsWith('comfy_')) {
       setVideoBackend('comfyui');
       setComfyPreset(item.model_id);
     } else if (item.model_id.startsWith('jimeng:')) {
@@ -743,6 +761,59 @@ export const VideoPage: React.FC<VideoPageProps> = ({
                     </div>
                   )}
 
+                  {comfyPreset === 'comfy_saved_workflow' && (
+                    <div className="mt-2.5 space-y-1.5">
+                      <label className="block text-[11px] font-semibold text-cyan-300">
+                        自動載入的 ComfyUI 工作流（{videoWorkflows.length} 個）
+                      </label>
+                      <select
+                        value={comfyWorkflowId}
+                        onChange={(e) => setComfyWorkflowId(e.target.value)}
+                        className="w-full px-3 py-2 rounded-xl bg-paper border border-cyan-500/40 text-xs font-semibold text-slateink focus:outline-none focus:border-cyan-400"
+                      >
+                        {videoWorkflows.length === 0 && (
+                          <option value="">尚未偵測到影片工作流</option>
+                        )}
+                        {videoWorkflows.some((w) => w.source === 'user') && (
+                          <optgroup label="★ 我的 ComfyUI 工作流">
+                            {videoWorkflows
+                              .filter((w) => w.source === 'user')
+                              .map((w) => (
+                                <option key={w.id} value={w.id}>
+                                  {w.title}
+                                </option>
+                              ))}
+                          </optgroup>
+                        )}
+                        {videoWorkflows.some((w) => w.source === 'template' && w.models_ready) && (
+                          <optgroup label="✓ 本機模型就緒影片範本">
+                            {videoWorkflows
+                              .filter((w) => w.source === 'template' && w.models_ready)
+                              .map((w) => (
+                                <option key={w.id} value={w.id}>
+                                  {w.title}
+                                </option>
+                              ))}
+                          </optgroup>
+                        )}
+                        {videoWorkflows.some((w) => w.source === 'template' && !w.models_ready) && (
+                          <optgroup label="其他 ComfyUI 影片範本">
+                            {videoWorkflows
+                              .filter((w) => w.source === 'template' && !w.models_ready)
+                              .map((w) => (
+                                <option key={w.id} value={w.id}>
+                                  {w.title}
+                                </option>
+                              ))}
+                          </optgroup>
+                        )}
+                      </select>
+                      <div className="text-[10px] text-slateink-muted">
+                        自動轉換 ComfyUI UI / 子圖工作流為 API 格式，並注入提示詞與首尾幀圖片。
+                      </div>
+                    </div>
+                  )}
+
                   {comfyPreset === 'comfy_custom_json' && (
                     <div className="mt-2.5 space-y-2">
                       <input
@@ -764,13 +835,13 @@ export const VideoPage: React.FC<VideoPageProps> = ({
                         className="w-full py-2 px-3 rounded-xl border border-dashed border-cyan-500/40 bg-paper hover:border-cyan-400 text-xs text-cyan-300 flex items-center justify-center gap-1.5"
                       >
                         <FileJson className="w-3.5 h-3.5" />
-                        {customWorkflowName ? `已載入：${customWorkflowName}` : '上傳 ComfyUI Export (API) JSON'}
+                        {customWorkflowName ? `已載入：${customWorkflowName}` : '上傳 ComfyUI 工作流 JSON（UI / API 皆可）'}
                       </button>
                       <textarea
                         rows={3}
                         value={customWorkflowJson}
                         onChange={(e) => setCustomWorkflowJson(e.target.value)}
-                        placeholder='或直接貼上 ComfyUI API JSON（支援 {{PROMPT}}、{{FIRST_FRAME}}、{{LAST_FRAME}} 佔位符，未標註亦會自動注入提示詞與圖片）'
+                        placeholder='或直接貼上任意 ComfyUI JSON（一般工作流與 Export API 皆自動支援，並注入提示詞與首尾幀）'
                         className="w-full px-3 py-2 rounded-xl bg-paper border border-paper-border text-[11px] font-mono resize-none"
                       />
                     </div>
