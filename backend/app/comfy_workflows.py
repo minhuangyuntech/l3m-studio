@@ -394,13 +394,15 @@ def _expand_subgraphs(raw_wf: Dict[str, Any]) -> Dict[str, Any]:
         sg_in_id = int((sg.get("inputNode") or {}).get("id", -10))
         sg_out_id = int((sg.get("outputNode") or {}).get("id", -20))
 
-        # Outer links entering this subgraph instance by input slot index
-        outer_in_by_slot: Dict[int, Tuple[int, int, str]] = {}
-        for slot_idx, inp_def in enumerate(node.get("inputs") or []):
+        # Subgraph input definitions (indexed by oslot) & outer links mapped by input NAME (not raw slot index!)
+        sg_inputs = sg.get("inputs") or []
+        outer_in_by_name: Dict[str, Tuple[int, int, str]] = {}
+        for inp_def in node.get("inputs") or []:
+            iname = str(inp_def.get("name") or "")
             lid = inp_def.get("link")
-            if lid is not None and int(lid) in link_by_id:
+            if iname and lid is not None and int(lid) in link_by_id:
                 ol = link_by_id[int(lid)]
-                outer_in_by_slot[slot_idx] = (int(ol[1]), int(ol[2]), str(ol[5]))
+                outer_in_by_name[iname] = (int(ol[1]), int(ol[2]), str(ol[5]))
 
         # Outer links leaving this subgraph instance by output slot index
         outer_out_by_slot: Dict[int, List[List[Any]]] = {}
@@ -425,11 +427,12 @@ def _expand_subgraphs(raw_wf: Dict[str, Any]) -> Dict[str, Any]:
                 continue
 
             if oid == sg_in_id:
-                # Driven by outer input slot (if linked) or default inner widget value
-                if oslot in outer_in_by_slot and tid in id_remap:
-                    src_nid, src_slot, _ = outer_in_by_slot[oslot]
+                # Match outer linked socket by subgraph input NAME (outer node omits unexposed widget sockets!)
+                sg_inp_name = str(sg_inputs[oslot].get("name", "")) if 0 <= oslot < len(sg_inputs) else ""
+                if sg_inp_name and sg_inp_name in outer_in_by_name and tid in id_remap:
+                    src_nid, src_slot, src_type = outer_in_by_name[sg_inp_name]
                     max_lid += 1
-                    new_link = [max_lid, src_nid, src_slot, id_remap[tid], tslot, ltype]
+                    new_link = [max_lid, src_nid, src_slot, id_remap[tid], tslot, src_type or ltype]
                     links.append(new_link)
                     link_by_id[max_lid] = new_link
                     inner_link_remap[old_lid] = max_lid
@@ -551,32 +554,44 @@ def convert_ui_workflow_to_api(raw_wf: Dict[str, Any], object_info: Dict[str, An
                     inputs_out[wname] = wvals[wname]
         elif isinstance(wvals, list):
             w_idx = 0
-            for wname, spec in ordered_widgets:
-                # Skip inputs that are wired to a link UNLESS LiteGraph still reserved a widget slot
-                # In ComfyUI LiteGraph, every widget input (even if converted to a linked input) consumes its slot in widgets_values!
-                if w_idx >= len(wvals):
-                    break
-                val = wvals[w_idx]
-                w_idx += 1
 
-                # Advance past ComfyUI's virtual 'control_after_generate' widget value after seed/noise_seed
-                if wname in ("seed", "noise_seed") or (
-                    isinstance(spec, list)
-                    and len(spec) > 1
-                    and isinstance(spec[1], dict)
-                    and spec[1].get("control_after_generate")
-                ):
-                    if w_idx < len(wvals) and str(wvals[w_idx]).lower() in _CONTROL_AFTER_GEN:
-                        w_idx += 1
+            def _consume_widgets(widget_list: List[Tuple[str, Any]], prefix: str = "") -> None:
+                nonlocal w_idx
+                for wname, spec in widget_list:
+                    if w_idx >= len(wvals):
+                        break
+                    full_name = f"{prefix}.{wname}" if prefix else wname
+                    val = wvals[w_idx]
+                    w_idx += 1
 
-                if wname not in linked_input_names:
-                    # Coerce COMBO/INT/FLOAT cleanly
+                    # Advance past ComfyUI's virtual 'control_after_generate' widget value after seed/noise_seed
+                    if wname in ("seed", "noise_seed") or (
+                        isinstance(spec, list)
+                        and len(spec) > 1
+                        and isinstance(spec[1], dict)
+                        and spec[1].get("control_after_generate")
+                    ):
+                        if w_idx < len(wvals) and str(wvals[w_idx]).lower() in _CONTROL_AFTER_GEN:
+                            w_idx += 1
+
                     first = spec[0] if isinstance(spec, list) and spec else ""
-                    if first == "INT" and isinstance(val, (int, float)):
-                        val = int(val)
-                    elif first == "FLOAT" and isinstance(val, (int, float)):
-                        val = float(val)
-                    inputs_out[wname] = val
+                    if full_name not in linked_input_names:
+                        if first == "INT" and isinstance(val, (int, float)):
+                            val = int(val)
+                        elif first == "FLOAT" and isinstance(val, (int, float)):
+                            val = float(val)
+                        inputs_out[full_name] = val
+
+                    # ComfyUI V3 DynamicCombo stores selected option's sub-widgets immediately after the selector value
+                    if first == "COMFY_DYNAMICCOMBO_V3" and len(spec) > 1 and isinstance(spec[1], dict):
+                        options = spec[1].get("options") or []
+                        matched_opt = next((o for o in options if isinstance(o, dict) and o.get("key") == val), None)
+                        if matched_opt and isinstance(matched_opt.get("inputs"), dict):
+                            sub_widgets = _ordered_widget_inputs({"input": matched_opt["inputs"]})
+                            if sub_widgets:
+                                _consume_widgets(sub_widgets, prefix=full_name)
+
+            _consume_widgets(ordered_widgets)
 
         api_prompt[str(nid)] = {
             "class_type": ctype,
@@ -591,6 +606,27 @@ def convert_ui_workflow_to_api(raw_wf: Dict[str, Any], object_info: Dict[str, An
             v = inp[k]
             if isinstance(v, list) and len(v) == 2 and str(v[0]) not in valid_ids:
                 del inp[k]
+
+    # Prune orphan/disconnected nodes not reachable backwards from any output node (e.g. unused optional last_frame branches)
+    output_ids = [
+        nid
+        for nid, n in api_prompt.items()
+        if bool((object_info.get(n["class_type"]) or {}).get("output_node"))
+    ]
+    if output_ids:
+        reachable: Set[str] = set()
+        stack = list(output_ids)
+        while stack:
+            cur = stack.pop()
+            if cur in reachable or cur not in api_prompt:
+                continue
+            reachable.add(cur)
+            for v in (api_prompt[cur].get("inputs") or {}).values():
+                if isinstance(v, list) and len(v) == 2:
+                    src_id = str(v[0])
+                    if src_id in api_prompt and src_id not in reachable:
+                        stack.append(src_id)
+        api_prompt = {nid: n for nid, n in api_prompt.items() if nid in reachable}
 
     return api_prompt
 
