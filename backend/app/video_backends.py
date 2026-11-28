@@ -887,6 +887,17 @@ async def _submit_and_wait_comfyui(
                 status_str = str(status_obj.get("status_str", ""))
                 if status_str == "error":
                     msgs = status_obj.get("messages", [])
+                    err_entry = next(
+                        (m[1] for m in msgs if isinstance(m, list) and len(m) >= 2 and m[0] == "execution_error" and isinstance(m[1], dict)),
+                        None,
+                    )
+                    if err_entry:
+                        nt = err_entry.get("node_type", "")
+                        em = str(err_entry.get("exception_message", "")).strip()
+                        hint = ""
+                        if "convrot" in em.lower() or "int8" in em.lower():
+                            hint = "（提示：INT8 convrot 權重需要 Ampere/Ada 以上架構 GPU [SM ≥ 8.0]，若在 Colab 請將執行階段從 Tesla T4 改選為 L4 或 A100！）"
+                        raise RuntimeError(f"ComfyUI 節點 {nt} 執行失敗：{em}{hint}")
                     raise RuntimeError(f"ComfyUI 執行發生錯誤：{json.dumps(msgs, ensure_ascii=False)[:450]}")
                 if status_obj.get("completed") or hist_entry.get("outputs"):
                     return hist_entry
