@@ -100,6 +100,7 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
   const [lightbox, setLightbox] = useState<MediaGalleryItem | null>(null);
   const [copiedId, setCopiedId] = useState('');
   const [notice, setNotice] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [showLibrary, setShowLibrary] = useState(false);
   const [negPresets, setNegPresets] = useState<NegativePromptPreset[]>([]);
@@ -122,17 +123,20 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
     return Array.from(new Set(parts)).join(', ');
   };
 
-  const loadAll = async () => {
+  const loadFast = async () => {
     try {
-      const [m, g, j] = await Promise.all([
-        api.getMediaModels(),
-        api.getMediaGallery('image'),
-        api.getMediaJobs(),
-      ]);
-      setMediaInfo(m);
+      const [g, j] = await Promise.all([api.getMediaGallery('image'), api.getMediaJobs()]);
       setGallery(g.items);
       setJobs(j.jobs.filter((x) => x.kind === 'image'));
+    } catch {
+      // ignore transient poll errors
+    }
+  };
 
+  const loadModels = async () => {
+    try {
+      const m = await api.getMediaModels();
+      setMediaInfo(m);
       if (!backendInitRef.current) {
         backendInitRef.current = true;
         if (m.engines.image_backend === 'sd_cli') setImageBackend('sd_cli');
@@ -140,7 +144,6 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
         if (m.engines.comfyui_mode) setComfyMode(m.engines.comfyui_mode);
         if (m.engines.comfyui_remote_url) setColabUrlDraft(m.engines.comfyui_remote_url);
       }
-
       const imgPresets = m.comfyui_status?.image_presets || [];
       if (imgPresets.length > 0) {
         setComfyPreset((prev) => (prev && imgPresets.some((p) => p.id === prev) ? prev : imgPresets[0].id));
@@ -153,7 +156,6 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
       if (wfs.length > 0) {
         setComfyWorkflowId((prev) => (prev && wfs.some((w) => w.id === prev) ? prev : wfs[0].id));
       }
-
       if (m.image_models.length > 0) {
         const turbo = m.image_models.find((x) => x.filename.toLowerCase().includes('z_image'));
         const defaultId = (turbo || m.image_models[0]).id;
@@ -164,9 +166,14 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
     }
   };
 
+  const loadAll = async () => {
+    await Promise.all([loadFast(), loadModels()]);
+  };
+
   useEffect(() => {
-    loadAll();
-    const timer = setInterval(loadAll, 2500);
+    loadFast();
+    loadModels();
+    const timer = setInterval(loadFast, 2000);
     return () => clearInterval(timer);
   }, []);
 
@@ -260,8 +267,9 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
     }
 
     setNotice('');
+    setSubmitting(true);
     try {
-      await api.generateImage({
+      const createdJob = await api.generateImage({
         image_backend: imageBackend,
         comfyui_mode: comfyMode,
         comfy_preset: comfyPreset,
@@ -282,9 +290,12 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
         auto_unload_llm: autoUnloadLlm,
         ref_image_data_url: refImage,
       });
-      await loadAll();
+      setJobs((prev) => [createdJob, ...prev.filter((x) => x.id !== createdJob.id)]);
+      await loadFast();
     } catch (err: any) {
       setNotice(err.message);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -744,11 +755,11 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
             ) : (
               <button
                 onClick={handleGenerate}
-                disabled={!prompt.trim() || (imageBackend === 'sd_cli' && !modelId)}
+                disabled={submitting || !prompt.trim() || (imageBackend === 'sd_cli' && !modelId)}
                 className="l3m-btn-primary w-full flex-1 min-h-[54px] rounded-xl text-sm flex items-center justify-center gap-2 disabled:opacity-45"
               >
                 <Wand2 className="w-4 h-4" />
-                {imageBackend === 'comfyui' ? 'ComfyUI 生成' : '生成畫面'}
+                {submitting ? '正在送出...' : imageBackend === 'comfyui' ? 'ComfyUI 生成' : '生成畫面'}
               </button>
             )}
             <div className="text-center font-mono text-[11px] text-slateink-muted">

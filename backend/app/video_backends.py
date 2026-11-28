@@ -23,9 +23,10 @@ from .comfy_workflows import (
 )
 from .config import config_manager
 
-# Short TTL cache for ComfyUI status probes so 2.5s UI polling stays instant
+# Short TTL cache for ComfyUI status probes (longer TTL for remote Colab HTTPS tunnels)
 _PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "data": None}
-_PROBE_TTL = 12.0
+_PROBE_TTL_LOCAL = 15.0
+_PROBE_TTL_REMOTE = 120.0
 
 
 def _is_remote_url(url: str) -> bool:
@@ -108,14 +109,15 @@ async def probe_comfyui(
 ) -> Dict[str, Any]:
     """Probe a running local or remote (Colab) ComfyUI server and detect pipelines & workflows."""
     eff_mode, configured, headers, is_remote = resolve_comfyui_connection(base_url=base_url, mode=mode, token=token)
-    eff_timeout = timeout if timeout is not None else (10.0 if is_remote else 3.0)
+    eff_timeout = timeout if timeout is not None else (15.0 if is_remote else 3.0)
+    ttl = _PROBE_TTL_REMOTE if is_remote else _PROBE_TTL_LOCAL
     cache_key = f"{eff_mode}|{configured}|{headers.get('X-API-Key', '')}"
     now = time.monotonic()
     if (
         not force
         and _PROBE_CACHE["data"] is not None
         and _PROBE_CACHE["key"] == cache_key
-        and (now - _PROBE_CACHE["ts"]) < _PROBE_TTL
+        and (now - _PROBE_CACHE["ts"]) < ttl
     ):
         return _PROBE_CACHE["data"]
 
@@ -753,21 +755,70 @@ def build_minimax_h3_workflow(
 # ---------- Shared ComfyUI Execution Helpers ----------
 
 
-async def _upload_image_to_comfyui(client: httpx.AsyncClient, base_url: str, img_path: Path) -> str:
-    mime = "image/png"
+async def _prepare_upload_bytes(img_path: Path, is_remote: bool) -> Tuple[str, bytes, str]:
+    """Compress large PNGs to high-quality JPEG when uploading over remote internet tunnels."""
+    raw_bytes = img_path.read_bytes()
     ext = img_path.suffix.lower()
-    if ext in (".jpg", ".jpeg"):
-        mime = "image/jpeg"
-    elif ext == ".webp":
-        mime = "image/webp"
-    files = {"image": (img_path.name, img_path.read_bytes(), mime)}
-    data = {"type": "input", "overwrite": "true"}
-    resp = await client.post(f"{base_url}/upload/image", files=files, data=data)
-    resp.raise_for_status()
-    info = resp.json()
-    name = info.get("name", img_path.name)
-    sub = info.get("subfolder", "")
-    return f"{sub}/{name}" if sub else name
+    mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/webp" if ext == ".webp" else "image/png"
+    upload_name = img_path.name
+
+    if is_remote and len(raw_bytes) > 300 * 1024:
+        # Try Pillow first, fallback to ffmpeg to shrink multi-MB PNGs -> ~120KB quality-92 JPEG
+        try:
+            import io
+            from PIL import Image  # type: ignore
+
+            with Image.open(io.BytesIO(raw_bytes)) as im:
+                im = im.convert("RGB")
+                if max(im.size) > 1280:
+                    im.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=92, optimize=True)
+                return f"{img_path.stem}.jpg", buf.getvalue(), "image/jpeg"
+        except Exception:
+            ffmpeg_bin = shutil.which("ffmpeg")
+            if ffmpeg_bin:
+                tmp_jpg = img_path.with_suffix(".upload.jpg")
+                ff_kwargs: Dict[str, Any] = {"stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.STDOUT}
+                if platform.system() == "Windows":
+                    ff_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                proc = await asyncio.create_subprocess_exec(
+                    ffmpeg_bin, "-y", "-i", str(img_path),
+                    "-vf", "scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease",
+                    "-q:v", "3", str(tmp_jpg),
+                    **ff_kwargs,
+                )
+                await proc.communicate()
+                if tmp_jpg.exists() and tmp_jpg.stat().st_size > 1024:
+                    compressed = tmp_jpg.read_bytes()
+                    tmp_jpg.unlink(missing_ok=True)
+                    return f"{img_path.stem}.jpg", compressed, "image/jpeg"
+    return upload_name, raw_bytes, mime
+
+
+async def _upload_image_to_comfyui(
+    client: httpx.AsyncClient,
+    base_url: str,
+    img_path: Path,
+    is_remote: bool = False,
+) -> str:
+    upload_name, payload_bytes, mime = await _prepare_upload_bytes(img_path, is_remote=is_remote)
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            files = {"image": (upload_name, payload_bytes, mime)}
+            data = {"type": "input", "overwrite": "true"}
+            resp = await client.post(f"{base_url}/upload/image", files=files, data=data)
+            resp.raise_for_status()
+            info = resp.json()
+            name = info.get("name", upload_name)
+            sub = info.get("subfolder", "")
+            return f"{sub}/{name}" if sub else name
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+    raise RuntimeError(f"上傳圖片至 ComfyUI 失敗（已重試 3 次）：{last_exc}")
 
 
 async def _transcode_to_mp4(src: Path, dst: Path) -> Path:
@@ -908,7 +959,9 @@ async def run_comfyui_image(
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Run image generation on local or remote (Colab) ComfyUI."""
     req_mode = params.get("comfyui_mode")
-    status = await probe_comfyui(mode=req_mode, force=True)
+    status = await probe_comfyui(mode=req_mode, force=False)
+    if not status["online"]:
+        status = await probe_comfyui(mode=req_mode, force=True)
     if not status["online"]:
         raise RuntimeError(
             f"無法連線至 ComfyUI（{status['url']}）：{status.get('error') or '請確認本機或 Colab ComfyUI 已啟動'}。"
@@ -935,7 +988,7 @@ async def run_comfyui_image(
         if ref_image_path and ref_image_path.exists():
             job["progress"] = 8
             job["message"] = "正在上傳參考圖片至 ComfyUI..."
-            ref_name = await _upload_image_to_comfyui(client, base_url, ref_image_path)
+            ref_name = await _upload_image_to_comfyui(client, base_url, ref_image_path, is_remote=is_remote)
 
         if is_cancelled():
             raise asyncio.CancelledError()
@@ -1049,7 +1102,9 @@ async def run_comfyui_video(
 ) -> Tuple[Path, Dict[str, Any]]:
     """Submit a video workflow to local or remote (Colab) ComfyUI, track execution, download & save MP4."""
     req_mode = params.get("comfyui_mode")
-    status = await probe_comfyui(mode=req_mode, force=True)
+    status = await probe_comfyui(mode=req_mode, force=False)
+    if not status["online"]:
+        status = await probe_comfyui(mode=req_mode, force=True)
     if not status["online"]:
         raise RuntimeError(
             f"無法連線至 ComfyUI（{status['url']}）：{status.get('error') or '請確認本機或 Colab ComfyUI 已啟動'}。"
@@ -1075,11 +1130,11 @@ async def run_comfyui_video(
         if first_frame_path and first_frame_path.exists():
             job["progress"] = 8
             job["message"] = f"正在上傳首幀圖片至 {node_prefix}..."
-            ff_name = await _upload_image_to_comfyui(client, base_url, first_frame_path)
+            ff_name = await _upload_image_to_comfyui(client, base_url, first_frame_path, is_remote=is_remote)
         if last_frame_path and last_frame_path.exists():
             job["progress"] = 10
             job["message"] = f"正在上傳尾幀圖片至 {node_prefix}..."
-            lf_name = await _upload_image_to_comfyui(client, base_url, last_frame_path)
+            lf_name = await _upload_image_to_comfyui(client, base_url, last_frame_path, is_remote=is_remote)
 
         if is_cancelled():
             raise asyncio.CancelledError()

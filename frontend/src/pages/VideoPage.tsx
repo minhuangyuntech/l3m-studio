@@ -120,6 +120,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
 
   const [notice, setNotice] = useState('');
   const [copiedId, setCopiedId] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [showLibrary, setShowLibrary] = useState(false);
   const [negPresets, setNegPresets] = useState<NegativePromptPreset[]>([]);
@@ -174,17 +175,32 @@ export const VideoPage: React.FC<VideoPageProps> = ({
     }
   }, [initialStartFrame, onConsumeInitialFrame]);
 
-  const loadAll = async () => {
+  const loadFast = async () => {
     try {
-      const [m, g, j] = await Promise.all([
-        api.getMediaModels(),
+      const [g, j] = await Promise.all([
         api.getMediaGallery(subTab === 'video' ? 'video' : 'lipsync'),
         api.getMediaJobs(),
       ]);
-      setMediaInfo(m);
       setGallery(g.items);
       setJobs(j.jobs.filter((x) => x.kind === subTab));
+      if (g.items.length > 0) {
+        const newest = g.items[0];
+        if (lastTopVideoIdRef.current && lastTopVideoIdRef.current !== newest.id) {
+          setSelectedVideo(newest);
+        } else {
+          setSelectedVideo((prev) => prev || newest);
+        }
+        lastTopVideoIdRef.current = newest.id;
+      }
+    } catch {
+      // ignore transient poll errors
+    }
+  };
 
+  const loadModels = async () => {
+    try {
+      const m = await api.getMediaModels();
+      setMediaInfo(m);
       if (!backendInitRef.current) {
         backendInitRef.current = true;
         if (m.engines.video_backend) setVideoBackend(m.engines.video_backend);
@@ -198,7 +214,6 @@ export const VideoPage: React.FC<VideoPageProps> = ({
           setJimengNoWatermark(!m.engines.jimeng_watermark);
         }
       }
-
       const presets = m.comfyui_status?.presets || [];
       if (presets.length > 0) {
         setComfyPreset((prev) => (prev && presets.some((p) => p.id === prev) ? prev : presets[0].id));
@@ -207,29 +222,24 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       if (wfs.length > 0) {
         setComfyWorkflowId((prev) => (prev && wfs.some((w) => w.id === prev) ? prev : wfs[0].id));
       }
-
       if (m.video_models.length > 0) {
         const wan = m.video_models.find((x) => x.filename.toLowerCase().includes('wan2.2'));
         const defaultId = (wan || m.video_models[0]).id;
         setModelId((prev) => (prev && m.video_models.some((x) => x.id === prev) ? prev : defaultId));
-      }
-      if (g.items.length > 0) {
-        const newest = g.items[0];
-        if (lastTopVideoIdRef.current && lastTopVideoIdRef.current !== newest.id) {
-          setSelectedVideo(newest);
-        } else {
-          setSelectedVideo((prev) => prev || newest);
-        }
-        lastTopVideoIdRef.current = newest.id;
       }
     } catch (err: any) {
       setNotice(`無法載入影片模型列表：${err?.message || '請重新啟動 L3M Studio 後端服務'}`);
     }
   };
 
+  const loadAll = async () => {
+    await Promise.all([loadFast(), loadModels()]);
+  };
+
   useEffect(() => {
-    loadAll();
-    const timer = setInterval(loadAll, 2500);
+    loadFast();
+    loadModels();
+    const timer = setInterval(loadFast, 2000);
     return () => clearInterval(timer);
   }, [subTab]);
 
@@ -316,8 +326,9 @@ export const VideoPage: React.FC<VideoPageProps> = ({
     }
 
     setNotice('');
+    setSubmitting(true);
     try {
-      await api.generateVideo({
+      const createdJob = await api.generateVideo({
         video_backend: videoBackend,
         comfyui_mode: comfyMode,
         comfy_preset: comfyPreset,
@@ -341,9 +352,12 @@ export const VideoPage: React.FC<VideoPageProps> = ({
         first_frame_data_url: firstFrame,
         last_frame_data_url: lastFrame,
       });
-      await loadAll();
+      setJobs((prev) => [createdJob, ...prev.filter((x) => x.id !== createdJob.id)]);
+      await loadFast();
     } catch (err: any) {
       setNotice(err.message);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -1311,15 +1325,17 @@ export const VideoPage: React.FC<VideoPageProps> = ({
               ) : (
                 <button
                   onClick={handleGenerateVideo}
-                  disabled={!prompt.trim() || (videoBackend === 'sd_cli' && !modelId)}
+                  disabled={submitting || !prompt.trim() || (videoBackend === 'sd_cli' && !modelId)}
                   className="l3m-btn-primary w-full py-3 rounded-xl text-sm flex items-center justify-center gap-2 disabled:opacity-45"
                 >
                   <Film className="w-4 h-4" />
-                  {videoBackend === 'comfyui'
-                    ? '透過 ComfyUI 生成影片'
-                    : videoBackend === 'jimeng'
-                      ? '透過即夢 API 生成影片'
-                      : '透過 sd-cli 生成影片'}
+                  {submitting
+                    ? '正在送出任務...'
+                    : videoBackend === 'comfyui'
+                      ? '透過 ComfyUI 生成影片'
+                      : videoBackend === 'jimeng'
+                        ? '透過即夢 API 生成影片'
+                        : '透過 sd-cli 生成影片'}
                 </button>
               )}
             </>
