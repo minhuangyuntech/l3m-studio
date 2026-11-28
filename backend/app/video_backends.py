@@ -19,6 +19,7 @@ from .comfy_workflows import (
     get_comfy_object_info,
     inject_workflow_params,
     list_comfyui_workflows,
+    reconcile_workflow_models,
 )
 from .config import config_manager
 
@@ -795,12 +796,12 @@ async def _prepare_loaded_or_custom_workflow(
     first_frame_name: Optional[str],
     last_frame_name: Optional[str],
 ) -> Dict[str, Any]:
+    obj_info = await get_comfy_object_info(base_url)
     if isinstance(raw_wf.get("nodes"), list):
-        obj_info = await get_comfy_object_info(base_url)
         api_wf = convert_ui_workflow_to_api(raw_wf, obj_info)
     else:
         api_wf = raw_wf
-    return inject_workflow_params(
+    injected = inject_workflow_params(
         api_wf,
         prompt=prompt,
         neg_prompt=neg_prompt,
@@ -812,6 +813,8 @@ async def _prepare_loaded_or_custom_workflow(
         first_frame_name=first_frame_name,
         last_frame_name=last_frame_name,
     )
+    reconciled, _remaps = reconcile_workflow_models(injected, obj_info)
+    return reconciled
 
 
 # ---------- Run ComfyUI Image Generation ----------

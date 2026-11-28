@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -15,6 +16,12 @@ _WF_LIST_CACHE: Dict[str, Any] = {"ts": 0.0, "url": "", "data": None}
 _WIDGET_TYPES = {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO", "COMFY_DYNAMICCOMBO_V3"}
 _CONTROL_AFTER_GEN = {"randomize", "fixed", "increment", "decrement"}
 _SKIP_NODE_TYPES = {"Note", "MarkdownNote", "Reroute", "PrimitiveNode"}
+_QUANT_NOISE_TOKENS = {
+    "safetensors", "ckpt", "pt", "pth", "gguf", "bin",
+    "fp16", "bf16", "fp32", "fp8", "e4m3fn", "e5m2", "int8", "int4", "fp4", "nvfp4",
+    "awq", "gptq", "convrot", "scaled", "mixed", "pruned", "comfy", "comfyui", "emaonly",
+    "fast", "default", "v1", "v10", "1", "0",
+}
 
 _VIDEO_NODE_HINTS = (
     "savevideo",
@@ -721,3 +728,94 @@ def inject_workflow_params(
         wf[load_img_nodes[1]]["inputs"]["image"] = last_frame_name
 
     return wf
+
+
+def _core_tokens(name: str) -> Set[str]:
+    base = name.replace("\\", "/").split("/")[-1].lower()
+    raw = [t for t in re.split(r"[^a-z0-9]+", base) if t]
+    core = {t for t in raw if t not in _QUANT_NOISE_TOKENS}
+    return core or set(raw)
+
+
+def _extract_allowed_options(spec: Any) -> Optional[List[str]]:
+    if not isinstance(spec, list) or not spec:
+        return None
+    first = spec[0]
+    if isinstance(first, list):
+        return [str(x) for x in first]
+    if first == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+        opts = spec[1].get("options")
+        if isinstance(opts, list):
+            return [str(x) for x in opts]
+    return None
+
+
+def reconcile_workflow_models(api_wf: Dict[str, Any], object_info: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Auto-remap template/workflow model filenames (e.g. int8_convrot -> fp16) to matching installed ComfyUI files."""
+    wf = copy.deepcopy(api_wf)
+    remaps: List[str] = []
+
+    for _nid, node in wf.items():
+        if not isinstance(node, dict):
+            continue
+        ctype = str(node.get("class_type", ""))
+        schema = object_info.get(ctype)
+        if not schema:
+            continue
+        inputs = node.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            continue
+
+        all_specs: Dict[str, Any] = {}
+        inp_schema = schema.get("input") or {}
+        for sec in ("required", "optional"):
+            s = inp_schema.get(sec)
+            if isinstance(s, dict):
+                all_specs.update(s)
+
+        for iname, val in list(inputs.items()):
+            if not isinstance(val, str):
+                continue
+            # Never silently replace a missing LoadImage with a random user photo
+            if ctype == "LoadImage" and iname == "image":
+                continue
+            allowed = _extract_allowed_options(all_specs.get(iname))
+            if not allowed or val in allowed:
+                continue
+
+            # 1. Exact basename match (handles subfolder differences like SDXL\sd_xl_base_1.0)
+            want_base = val.replace("\\", "/").split("/")[-1].lower()
+            exact_base = next(
+                (opt for opt in allowed if opt.replace("\\", "/").split("/")[-1].lower() == want_base),
+                None,
+            )
+            if exact_base:
+                inputs[iname] = exact_base
+                remaps.append(f"{val} -> {exact_base}")
+                continue
+
+            # 2. Core token similarity match (handles fp16 vs int8_convrot vs bf16 vs fp8 variants)
+            want_toks = _core_tokens(val)
+            best_opt: Optional[str] = None
+            best_score = 0.0
+            for opt in allowed:
+                opt_toks = _core_tokens(opt)
+                inter = want_toks & opt_toks
+                if not inter:
+                    continue
+                # Prevent video/audio VAE cross-matching
+                if ("video" in want_toks and "audio" in opt_toks) or ("audio" in want_toks and "video" in opt_toks):
+                    continue
+                jaccard = len(inter) / max(1, len(want_toks | opt_toks))
+                recall = len(inter) / max(1, len(want_toks))
+                score = 0.6 * jaccard + 0.4 * recall
+                if score > best_score and (len(inter) >= 2 or jaccard >= 0.6):
+                    best_score = score
+                    best_opt = opt
+
+            if best_opt and best_score >= 0.55:
+                inputs[iname] = best_opt
+                remaps.append(f"{val} -> {best_opt}")
+
+    return wf, remaps
+
