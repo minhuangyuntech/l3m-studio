@@ -18,7 +18,7 @@ from .engine import engine_manager
 from .hardware import get_hardware_info, get_realtime_metrics
 from .comfy_workflows import fetch_comfyui_workflow_raw
 from .media import IMAGES_DIR, LIPSYNC_DIR, VIDEOS_DIR, media_manager
-from .video_backends import probe_comfyui
+from .video_backends import probe_comfyui, resolve_comfyui_connection
 from .models import (
     download_manager,
     get_recommended_models,
@@ -339,7 +339,24 @@ async def media_comfyui_status(force: bool = Query(default=False)) -> Dict[str, 
 @router.post("/media/comfyui/test")
 async def media_comfyui_test(body: Dict[str, Any]) -> Dict[str, Any]:
     url = str(body.get("url") or "").strip() or None
-    return await probe_comfyui(base_url=url, force=True, timeout=4.0)
+    mode = str(body.get("mode") or "").strip() or None
+    token = body.get("token")
+    return await probe_comfyui(base_url=url, mode=mode, token=token, force=True, timeout=10.0)
+
+
+@router.post("/media/comfyui/mode")
+async def media_comfyui_switch_mode(body: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(body.get("mode") or "local").strip().lower()
+    if mode not in ("local", "remote"):
+        raise HTTPException(status_code=400, detail="無效的 ComfyUI 模式")
+    patch: Dict[str, Any] = {"comfyui_mode": mode}
+    if "remote_url" in body and body["remote_url"] is not None:
+        patch["comfyui_remote_url"] = str(body["remote_url"]).strip().rstrip("/")
+    if "remote_token" in body and body["remote_token"] is not None:
+        patch["comfyui_remote_token"] = str(body["remote_token"]).strip()
+    config_manager.update(patch)
+    status = await probe_comfyui(mode=mode, force=True)
+    return {"mode": mode, "status": status}
 
 
 @router.get("/media/comfyui/workflows")
@@ -360,7 +377,8 @@ async def media_comfyui_workflow_detail(workflow_id: str = Query(...)) -> Dict[s
     if not status.get("online"):
         raise HTTPException(status_code=503, detail="ComfyUI 未連線")
     try:
-        raw, name = await fetch_comfyui_workflow_raw(status["url"], workflow_id)
+        _, _, headers, _ = resolve_comfyui_connection(base_url=status["url"], mode=status.get("mode"))
+        raw, name = await fetch_comfyui_workflow_raw(status["url"], workflow_id, headers=headers)
         return {"workflow_id": workflow_id, "name": name, "workflow": raw}
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"讀取 ComfyUI 工作流失敗：{exc}")

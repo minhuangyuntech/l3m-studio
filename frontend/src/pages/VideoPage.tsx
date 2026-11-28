@@ -76,6 +76,9 @@ export const VideoPage: React.FC<VideoPageProps> = ({
   // Video Backend Engine: comfyui (default) | jimeng | sd_cli
   const [videoBackend, setVideoBackend] = useState<'comfyui' | 'jimeng' | 'sd_cli'>('comfyui');
   const backendInitRef = useRef(false);
+  const [comfyMode, setComfyMode] = useState<'local' | 'remote'>('local');
+  const [colabUrlDraft, setColabUrlDraft] = useState('');
+  const [switchingNode, setSwitchingNode] = useState(false);
   const [comfyPreset, setComfyPreset] = useState('comfy_ltx25');
   const [comfyWorkflowId, setComfyWorkflowId] = useState('');
   const [customWorkflowJson, setCustomWorkflowJson] = useState('');
@@ -185,6 +188,8 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       if (!backendInitRef.current) {
         backendInitRef.current = true;
         if (m.engines.video_backend) setVideoBackend(m.engines.video_backend);
+        if (m.engines.comfyui_mode) setComfyMode(m.engines.comfyui_mode);
+        if (m.engines.comfyui_remote_url) setColabUrlDraft(m.engines.comfyui_remote_url);
         if (m.engines.jimeng_model) setJimengModel(m.engines.jimeng_model);
         if (typeof m.engines.jimeng_generate_audio === 'boolean') {
           setJimengAudio(m.engines.jimeng_generate_audio);
@@ -237,6 +242,26 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       setNotice(`檢測 ComfyUI 失敗：${err.message}`);
     } finally {
       setProbingComfy(false);
+    }
+  };
+
+  const handleSwitchComfyNode = async (nextMode: 'local' | 'remote', overrideUrl?: string) => {
+    setComfyMode(nextMode);
+    setSwitchingNode(true);
+    setNotice('');
+    try {
+      const res = await api.switchComfyuiMode({
+        mode: nextMode,
+        remote_url: nextMode === 'remote' ? (overrideUrl ?? colabUrlDraft) : undefined,
+      });
+      await loadAll();
+      if (!res.status.online && nextMode === 'remote' && (overrideUrl ?? colabUrlDraft).trim()) {
+        setNotice(`無法連上 Colab ComfyUI：${res.status.error || '請確認 Colab 步驟 4 正在執行且網址正確'}`);
+      }
+    } catch (err: any) {
+      setNotice(`切換 ComfyUI 節點失敗：${err.message}`);
+    } finally {
+      setSwitchingNode(false);
     }
   };
 
@@ -294,6 +319,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
     try {
       await api.generateVideo({
         video_backend: videoBackend,
+        comfyui_mode: comfyMode,
         comfy_preset: comfyPreset,
         comfy_workflow_id: comfyPreset === 'comfy_saved_workflow' ? comfyWorkflowId : undefined,
         comfy_workflow_json: comfyPreset === 'comfy_custom_json' ? customWorkflowJson : undefined,
@@ -435,8 +461,12 @@ export const VideoPage: React.FC<VideoPageProps> = ({
               }`}
             />
             {comfyOnline
-              ? `ComfyUI 已連線 (${comfyUrl.replace('http://127.0.0.1', '')})`
-              : 'ComfyUI 未連線'}
+              ? mediaInfo?.comfyui_status?.is_remote
+                ? `Colab ComfyUI 已連線`
+                : `本機 ComfyUI 已連線 (${comfyUrl.replace('http://127.0.0.1', '')})`
+              : comfyMode === 'remote'
+                ? 'Colab ComfyUI 未連線'
+                : '本機 ComfyUI 未連線'}
             <RefreshCw className={`w-3 h-3 ${probingComfy ? 'animate-spin' : ''}`} />
           </button>
 
@@ -475,7 +505,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
       </div>
 
       {/* VRAM Conflict Reminder (only relevant for local GPU backends) */}
-      {mediaInfo?.engines.llm_running && videoBackend !== 'jimeng' && (
+      {mediaInfo?.engines.llm_running && videoBackend !== 'jimeng' && !(videoBackend === 'comfyui' && comfyMode === 'remote') && (
         <div className="rounded-xl bg-amber-500/12 border border-amber-500/40 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
           <div>
             <strong>顯存衝突提醒：</strong>背景的本地語言模型（
@@ -711,7 +741,64 @@ export const VideoPage: React.FC<VideoPageProps> = ({
 
               {/* ENGINE-SPECIFIC MODEL / PIPELINE SELECTOR */}
               {videoBackend === 'comfyui' && (
-                <div>
+                <div className="space-y-2.5">
+                  {/* Local vs Colab Pro Remote ComfyUI Node Switcher */}
+                  <div className="rounded-xl bg-paper p-2 border border-paper-border space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-slateink-muted">ComfyUI 算力節點</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={switchingNode}
+                          onClick={() => handleSwitchComfyNode('local')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${
+                            comfyMode === 'local'
+                              ? 'bg-cyan-500/20 border border-cyan-400/60 text-cyan-200'
+                              : 'text-slateink-muted hover:text-slateink'
+                          }`}
+                        >
+                          本機 GPU
+                        </button>
+                        <button
+                          type="button"
+                          disabled={switchingNode}
+                          onClick={() => handleSwitchComfyNode('remote')}
+                          className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${
+                            comfyMode === 'remote'
+                              ? 'bg-indigo-500/25 border border-indigo-400/60 text-indigo-200'
+                              : 'text-slateink-muted hover:text-slateink'
+                          }`}
+                        >
+                          雲端 Colab Pro
+                        </button>
+                      </div>
+                    </div>
+                    {comfyMode === 'remote' && (
+                      <div className="flex gap-1.5">
+                        <input
+                          value={colabUrlDraft}
+                          onChange={(e) => setColabUrlDraft(e.target.value)}
+                          placeholder="貼上 https://xxxx.trycloudflare.com"
+                          className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg bg-paper-card border border-indigo-500/35 text-[11px] font-mono text-slateink focus:outline-none focus:border-indigo-400"
+                        />
+                        <button
+                          type="button"
+                          disabled={switchingNode || !colabUrlDraft.trim()}
+                          onClick={() => handleSwitchComfyNode('remote', colabUrlDraft)}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-semibold shrink-0 disabled:opacity-45"
+                        >
+                          {switchingNode ? '連線中' : '連線'}
+                        </button>
+                      </div>
+                    )}
+                    {comfyOnline && mediaInfo?.comfyui_status?.gpu_name && (
+                      <div className="text-[10px] font-mono text-emerald-300/90 truncate">
+                        GPU：{mediaInfo.comfyui_status.gpu_name}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
                   <div className="flex items-center justify-between mb-1.5">
                     <label className="text-xs font-bold text-slateink-muted">ComfyUI 影片管線</label>
                     {activeComfyPreset?.badge && (
@@ -846,6 +933,7 @@ export const VideoPage: React.FC<VideoPageProps> = ({
                       />
                     </div>
                   )}
+                  </div>
                 </div>
               )}
 

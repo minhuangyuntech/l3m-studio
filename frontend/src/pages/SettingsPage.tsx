@@ -245,36 +245,95 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="font-bold text-sm text-slateink flex items-center gap-2">
             <Workflow className="w-4 h-4 text-cyan-400" />
-            畫圖與影片引擎（ComfyUI / stable-diffusion.cpp）
+            畫圖與影片引擎（本機 / Colab Pro 遠端 ComfyUI）
           </div>
-          <button
-            type="button"
-            disabled={testingComfy}
-            onClick={async () => {
-              setTestingComfy(true);
-              try {
-                const res = await api.testComfyui(form.comfyui_url);
-                setComfyResult(res);
-              } finally {
-                setTestingComfy(false);
-              }
-            }}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25 text-xs font-semibold transition"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${testingComfy ? 'animate-spin' : ''}`} />
-            {testingComfy ? '測試中...' : '測試 ComfyUI 連線'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={testingComfy}
+              onClick={async () => {
+                setTestingComfy(true);
+                try {
+                  const res = await api.testComfyui(form.comfyui_url, 'local');
+                  setComfyResult(res);
+                } finally {
+                  setTestingComfy(false);
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-cyan-500/15 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/25 text-xs font-semibold transition"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${testingComfy ? 'animate-spin' : ''}`} />
+              測試本機
+            </button>
+            <button
+              type="button"
+              disabled={testingComfy || !form.comfyui_remote_url?.trim()}
+              onClick={async () => {
+                setTestingComfy(true);
+                try {
+                  const res = await api.testComfyui(
+                    form.comfyui_remote_url,
+                    'remote',
+                    form.comfyui_remote_token,
+                  );
+                  setComfyResult(res);
+                } finally {
+                  setTestingComfy(false);
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-500/15 border border-indigo-400/40 text-indigo-300 hover:bg-indigo-500/25 text-xs font-semibold transition disabled:opacity-45"
+            >
+              <Cloud className="w-3.5 h-3.5" />
+              測試 Colab
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
           <div>
+            <label className="block font-semibold text-slateink-muted mb-1">目前啟用的 ComfyUI 算力節點</label>
+            <select
+              value={form.comfyui_mode || 'local'}
+              onChange={(e) =>
+                setForm({ ...form, comfyui_mode: e.target.value as 'local' | 'remote' })
+              }
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-semibold"
+            >
+              <option value="local">本機 ComfyUI（127.0.0.1:8000 / :8188）</option>
+              <option value="remote">遠端 Google Colab Pro ComfyUI（雲端 L4 / A100）</option>
+            </select>
+          </div>
+          <div>
             <label className="block font-semibold text-slateink-muted mb-1">
-              ComfyUI 伺服器網址（桌面版預設 :8000 / 攜帶版 :8188）
+              本機 ComfyUI 伺服器網址（桌面版 :8000 / 攜帶版 :8188）
             </label>
             <input
               value={form.comfyui_url || ''}
               onChange={(e) => setForm({ ...form, comfyui_url: e.target.value })}
               placeholder="http://127.0.0.1:8000"
+              className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">
+              遠端 Colab ComfyUI 網址（Cloudflare / ngrok HTTPS）
+            </label>
+            <input
+              value={form.comfyui_remote_url || ''}
+              onChange={(e) => setForm({ ...form, comfyui_remote_url: e.target.value })}
+              placeholder="https://xxxx-xxxx.trycloudflare.com"
+              className="w-full px-3 py-2 rounded-xl border border-indigo-500/35 bg-paper font-mono"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slateink-muted mb-1">
+              遠端 Colab 認證 Token（選填，對應筆記本 AUTH_TOKEN）
+            </label>
+            <input
+              type="password"
+              value={form.comfyui_remote_token || ''}
+              onChange={(e) => setForm({ ...form, comfyui_remote_token: e.target.value })}
+              placeholder="若 Colab 未設定可留空"
               className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
             />
           </div>
@@ -287,7 +346,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
               }
               className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-semibold"
             >
-              <option value="comfyui">ComfyUI 本機後台（推薦 · BF16 / SDXL / 工作流）</option>
+              <option value="comfyui">ComfyUI 後台（推薦 · BF16 / SDXL / 工作流）</option>
               <option value="sd_cli">本機 sd-cli（輕量 GGUF）</option>
               <option value="custom_api">自訂繪圖 API（OpenAI 相容）</option>
             </select>
@@ -301,7 +360,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
               }
               className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-semibold"
             >
-              <option value="comfyui">ComfyUI 本機後台（推薦 · INT8 高畫質）</option>
+              <option value="comfyui">ComfyUI 後台（推薦 · INT8 高畫質／Colab 雲端）</option>
               <option value="jimeng">即夢 API（火山方舟 Seedance 雲端）</option>
               <option value="sd_cli">本機 sd-cli（輕量 GGUF 備用）</option>
             </select>
@@ -324,6 +383,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ settings, onSaved })
               className="w-full px-3 py-2 rounded-xl border border-paper-border bg-paper font-mono"
             />
           </div>
+        </div>
+        <div className="rounded-xl bg-indigo-500/8 border border-indigo-400/25 px-3 py-2 text-[11px] text-indigo-200">
+          專案已內附開箱即用的 Google Colab Pro 啟動筆記本：
+          <span className="font-mono text-cyan-300"> D:\projects\locmodel-studio\colab\L3M_ComfyUI_Colab_Pro.ipynb</span>
+          ，上傳至 Colab 執行後貼上產生的 <span className="font-mono">trycloudflare.com</span> 網址即可遠端使用 L4 / A100 顯卡算力。
         </div>
 
         {comfyResult && (

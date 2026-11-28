@@ -159,10 +159,19 @@ export const api = {
   getMediaModels: () => req<MediaModelsResponse>('/api/media/models'),
   getComfyuiStatus: (force = false) =>
     req<ComfyUIStatus>(`/api/media/comfyui/status${force ? '?force=true' : ''}`),
-  testComfyui: (url?: string) =>
+  testComfyui: (url?: string, mode?: 'local' | 'remote', token?: string) =>
     req<ComfyUIStatus>('/api/media/comfyui/test', {
       method: 'POST',
-      body: JSON.stringify({ url: url || '' }),
+      body: JSON.stringify({ url: url || '', mode: mode || '', token }),
+    }),
+  switchComfyuiMode: (payload: {
+    mode: 'local' | 'remote';
+    remote_url?: string;
+    remote_token?: string;
+  }) =>
+    req<{ mode: 'local' | 'remote'; status: ComfyUIStatus }>('/api/media/comfyui/mode', {
+      method: 'POST',
+      body: JSON.stringify(payload),
     }),
   getComfyuiWorkflows: (kind?: 'image' | 'video', force = false) =>
     req<{ online: boolean; url: string; workflows: ComfyUIWorkflowSummary[] }>(

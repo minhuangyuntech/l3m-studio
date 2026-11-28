@@ -118,6 +118,9 @@ class AppConfig(BaseModel):
     external_api_model: str = ""
     sd_cli_path: str = ""
     comfyui_url: str = Field(default_factory=_discover_comfyui_url)
+    comfyui_mode: str = "local"  # local | remote
+    comfyui_remote_url: str = ""
+    comfyui_remote_token: str = ""
     custom_image_api: str = ""
     image_backend: str = "comfyui"  # comfyui | sd_cli | custom_api
     video_backend: str = "comfyui"  # comfyui | jimeng | sd_cli

@@ -24,8 +24,55 @@ from .comfy_workflows import (
 from .config import config_manager
 
 # Short TTL cache for ComfyUI status probes so 2.5s UI polling stays instant
-_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "url": "", "data": None}
+_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "key": "", "data": None}
 _PROBE_TTL = 12.0
+
+
+def _is_remote_url(url: str) -> bool:
+    low = url.strip().lower()
+    return bool(low) and not (
+        low.startswith("http://127.0.0.1")
+        or low.startswith("http://localhost")
+        or low.startswith("http://[::1]")
+    )
+
+
+def build_comfyui_headers(url: str, token: str = "") -> Dict[str, str]:
+    hdrs: Dict[str, str] = {"User-Agent": "L3M-Studio/1.2"}
+    if _is_remote_url(url):
+        # Prevent ngrok free-tier browser interstitial warnings when tunnelling ComfyUI
+        hdrs["ngrok-skip-browser-warning"] = "true"
+    tok = token.strip()
+    if tok:
+        hdrs["Authorization"] = f"Bearer {tok}"
+        hdrs["X-API-Key"] = tok
+    return hdrs
+
+
+def resolve_comfyui_connection(
+    base_url: Optional[str] = None,
+    mode: Optional[str] = None,
+    token: Optional[str] = None,
+) -> Tuple[str, str, Dict[str, str], bool]:
+    """Return (active_mode, url, headers, is_remote) for local or remote Colab ComfyUI."""
+    cfg = config_manager.config
+    eff_mode = (mode or cfg.comfyui_mode or "local").strip().lower()
+    if eff_mode not in ("local", "remote"):
+        eff_mode = "local"
+    if base_url is not None and base_url.strip():
+        eff_url = base_url.strip().rstrip("/")
+        eff_remote = _is_remote_url(eff_url)
+        eff_tok = token if token is not None else (cfg.comfyui_remote_token if eff_remote else "")
+        return ("remote" if eff_remote else "local"), eff_url, build_comfyui_headers(eff_url, eff_tok), eff_remote
+
+    if eff_mode == "remote":
+        eff_url = (cfg.comfyui_remote_url or "").strip().rstrip("/")
+        eff_tok = token if token is not None else (cfg.comfyui_remote_token or "")
+        return "remote", eff_url, build_comfyui_headers(eff_url, eff_tok), True
+
+    eff_url = (cfg.comfyui_url or "http://127.0.0.1:8000").strip().rstrip("/")
+    eff_tok = token or ""
+    return "local", eff_url, build_comfyui_headers(eff_url, eff_tok), _is_remote_url(eff_url)
 
 
 def _pick(items: List[str], *substrings: str) -> str:
@@ -52,26 +99,30 @@ def _extract_combo_list(node_info: Dict[str, Any], key: str) -> List[str]:
     return []
 
 
-async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, timeout: float = 3.0) -> Dict[str, Any]:
-    """Probe a running ComfyUI server and detect available image/video pipelines & installed workflows."""
-    configured = (base_url or config_manager.config.comfyui_url or "http://127.0.0.1:8000").strip().rstrip("/")
+async def probe_comfyui(
+    base_url: Optional[str] = None,
+    mode: Optional[str] = None,
+    token: Optional[str] = None,
+    force: bool = False,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Probe a running local or remote (Colab) ComfyUI server and detect pipelines & workflows."""
+    eff_mode, configured, headers, is_remote = resolve_comfyui_connection(base_url=base_url, mode=mode, token=token)
+    eff_timeout = timeout if timeout is not None else (10.0 if is_remote else 3.0)
+    cache_key = f"{eff_mode}|{configured}|{headers.get('X-API-Key', '')}"
     now = time.monotonic()
     if (
         not force
         and _PROBE_CACHE["data"] is not None
-        and _PROBE_CACHE["url"] == configured
+        and _PROBE_CACHE["key"] == cache_key
         and (now - _PROBE_CACHE["ts"]) < _PROBE_TTL
     ):
         return _PROBE_CACHE["data"]
 
-    candidates = [configured]
-    if not base_url:
-        for fb in ("http://127.0.0.1:8000", "http://127.0.0.1:8188"):
-            if fb not in candidates:
-                candidates.append(fb)
-
     result: Dict[str, Any] = {
         "online": False,
+        "mode": eff_mode,
+        "is_remote": is_remote,
         "url": configured,
         "version": "",
         "gpu_name": "",
@@ -88,7 +139,18 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
         "workflows": [],
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    if not configured:
+        result["error"] = "尚未填寫遠端 Colab ComfyUI 網址（請貼上 Cloudflare Tunnel 產生的 https://*.trycloudflare.com 網址）"
+        _PROBE_CACHE.update({"ts": now, "key": cache_key, "data": result})
+        return result
+
+    candidates = [configured]
+    if not base_url and eff_mode == "local" and not is_remote:
+        for fb in ("http://127.0.0.1:8000", "http://127.0.0.1:8188"):
+            if fb not in candidates:
+                candidates.append(fb)
+
+    async with httpx.AsyncClient(timeout=eff_timeout, headers=headers, follow_redirects=True) as client:
         active_url = ""
         sys_data: Dict[str, Any] = {}
         last_err = ""
@@ -99,16 +161,21 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
                     active_url = cand
                     sys_data = r.json()
                     break
+                elif r.status_code == 401:
+                    last_err = "遠端 ComfyUI 認證失敗 (HTTP 401)，請檢查「遠端認證 Token」是否與 Colab 設定一致"
+                    break
+                else:
+                    last_err = f"HTTP {r.status_code}"
             except Exception as exc:
                 last_err = str(exc)
 
         if not active_url:
             result["error"] = last_err or f"無法連線至 ComfyUI ({configured})"
-            _PROBE_CACHE.update({"ts": now, "url": configured, "data": result})
+            _PROBE_CACHE.update({"ts": now, "key": cache_key, "data": result})
             return result
 
-        # Auto-update saved URL if we discovered ComfyUI running on the alternate default port
-        if not base_url and active_url != configured and configured in ("http://127.0.0.1:8188", "http://127.0.0.1:8000"):
+        # Auto-update saved local URL if we discovered local ComfyUI running on the alternate default port
+        if not base_url and eff_mode == "local" and active_url != configured and configured in ("http://127.0.0.1:8188", "http://127.0.0.1:8000"):
             config_manager.update({"comfyui_url": active_url})
 
         result["online"] = True
@@ -214,7 +281,13 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
 
         # Auto-discover installed ComfyUI workflows (user saved + extensions + templates)
         installed_files: Set[str] = set(checkpoints + unets + clips + vaes + loras)
-        workflows = await list_comfyui_workflows(active_url, installed_files=installed_files, force=force)
+        workflows = await list_comfyui_workflows(
+            active_url,
+            installed_files=installed_files,
+            force=force,
+            headers=headers,
+            timeout=15.0 if is_remote else 8.0,
+        )
         result["workflows"] = workflows
 
         # Build Image Presets
@@ -313,16 +386,20 @@ async def probe_comfyui(base_url: Optional[str] = None, force: bool = False, tim
         })
         result["presets"] = presets
 
-    _PROBE_CACHE.update({"ts": now, "url": configured, "data": result})
+    _PROBE_CACHE.update({"ts": now, "key": cache_key, "data": result})
     return result
 
 
-async def interrupt_comfyui(base_url: str, prompt_id: str = "") -> None:
-    url = (base_url or config_manager.config.comfyui_url).strip().rstrip("/")
+async def interrupt_comfyui(base_url: str, prompt_id: str = "", headers: Optional[Dict[str, str]] = None) -> None:
+    if base_url:
+        url = base_url.strip().rstrip("/")
+        hdrs = headers or build_comfyui_headers(url, config_manager.config.comfyui_remote_token if _is_remote_url(url) else "")
+    else:
+        _, url, hdrs, _ = resolve_comfyui_connection()
     if not url:
         return
     try:
-        async with httpx.AsyncClient(timeout=4.0) as client:
+        async with httpx.AsyncClient(timeout=8.0, headers=hdrs, follow_redirects=True) as client:
             if prompt_id:
                 await client.post(f"{url}/queue", json={"delete": [prompt_id]})
             await client.post(f"{url}/interrupt")
@@ -795,8 +872,9 @@ async def _prepare_loaded_or_custom_workflow(
     seed: int,
     first_frame_name: Optional[str],
     last_frame_name: Optional[str],
+    headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    obj_info = await get_comfy_object_info(base_url)
+    obj_info = await get_comfy_object_info(base_url, headers=headers, timeout=30.0)
     if isinstance(raw_wf.get("nodes"), list):
         api_wf = convert_ui_workflow_to_api(raw_wf, obj_info)
     else:
@@ -828,14 +906,16 @@ async def run_comfyui_image(
     is_cancelled: Callable[[], bool],
     on_prompt_submitted: Callable[[str, str], None],
 ) -> Tuple[List[Path], Dict[str, Any]]:
-    """Run image generation on local ComfyUI (Z-Image-Turbo / Checkpoint / Auto-Loaded Workflow / Custom JSON)."""
-    status = await probe_comfyui(force=True)
+    """Run image generation on local or remote (Colab) ComfyUI."""
+    req_mode = params.get("comfyui_mode")
+    status = await probe_comfyui(mode=req_mode, force=True)
     if not status["online"]:
         raise RuntimeError(
-            f"無法連線至 ComfyUI（{status['url']}）。請確認 ComfyUI 已在背景啟動，或於「設定」檢查 ComfyUI 伺服器網址。"
+            f"無法連線至 ComfyUI（{status['url']}）：{status.get('error') or '請確認本機或 Colab ComfyUI 已啟動'}。"
         )
 
     base_url = status["url"].rstrip("/")
+    _, _, headers, is_remote = resolve_comfyui_connection(base_url=base_url, mode=status.get("mode"))
     preset_id = str(params.get("comfy_preset") or "comfy_z_image_turbo")
     prompt = str(params.get("prompt", "")).strip()
     neg_prompt = str(params.get("negative_prompt", "")).strip()
@@ -850,7 +930,7 @@ async def run_comfyui_image(
     ckpt_name = str(params.get("comfy_checkpoint") or "").strip()
     detected = status["detected"]
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0 if is_remote else 120.0, headers=headers, follow_redirects=True) as client:
         ref_name: Optional[str] = None
         if ref_image_path and ref_image_path.exists():
             job["progress"] = 8
@@ -866,20 +946,20 @@ async def run_comfyui_image(
                 raise ValueError("請先從下拉選單選擇一個已安裝的 ComfyUI 工作流。")
             job["progress"] = 10
             job["message"] = "正在載入並轉換 ComfyUI 工作流..."
-            raw_wf, wf_name = await fetch_comfyui_workflow_raw(base_url, wf_id)
+            raw_wf, wf_name = await fetch_comfyui_workflow_raw(base_url, wf_id, headers=headers)
             workflow = await _prepare_loaded_or_custom_workflow(
-                base_url, raw_wf, prompt, neg_prompt, width, height, batch_count, steps, seed, ref_name, None
+                base_url, raw_wf, prompt, neg_prompt, width, height, batch_count, steps, seed, ref_name, None, headers=headers
             )
-            model_meta = {"id": f"comfy_wf:{wf_id}", "name": f"ComfyUI 工作流 · {wf_name}", "quantization": "Workflow"}
+            model_meta = {"id": f"comfy_wf:{wf_id}", "name": f"ComfyUI 工作流 · {wf_name}", "quantization": "Colab" if is_remote else "Workflow"}
         elif preset_id == "comfy_custom_json":
             raw_str = str(params.get("comfy_workflow_json") or "").strip()
             if not raw_str:
                 raise ValueError("請先上傳或貼上 ComfyUI JSON 工作流。")
             raw_wf = json.loads(raw_str)
             workflow = await _prepare_loaded_or_custom_workflow(
-                base_url, raw_wf, prompt, neg_prompt, width, height, batch_count, steps, seed, ref_name, None
+                base_url, raw_wf, prompt, neg_prompt, width, height, batch_count, steps, seed, ref_name, None, headers=headers
             )
-            model_meta = {"id": "comfy_custom_json", "name": "ComfyUI 自訂工作流", "quantization": "JSON"}
+            model_meta = {"id": "comfy_custom_json", "name": "ComfyUI 自訂工作流", "quantization": "Colab" if is_remote else "JSON"}
         elif preset_id == "comfy_checkpoint":
             if not ckpt_name:
                 ckpts = status.get("checkpoints") or []
@@ -967,14 +1047,16 @@ async def run_comfyui_video(
     is_cancelled: Callable[[], bool],
     on_prompt_submitted: Callable[[str, str], None],
 ) -> Tuple[Path, Dict[str, Any]]:
-    """Submit a video workflow to local ComfyUI, track execution, download & save MP4."""
-    status = await probe_comfyui(force=True)
+    """Submit a video workflow to local or remote (Colab) ComfyUI, track execution, download & save MP4."""
+    req_mode = params.get("comfyui_mode")
+    status = await probe_comfyui(mode=req_mode, force=True)
     if not status["online"]:
         raise RuntimeError(
-            f"無法連線至 ComfyUI（{status['url']}）。請確認 ComfyUI 已在背景啟動，或於「設定」檢查 ComfyUI 伺服器網址。"
+            f"無法連線至 ComfyUI（{status['url']}）：{status.get('error') or '請確認本機或 Colab ComfyUI 已啟動'}。"
         )
 
     base_url = status["url"].rstrip("/")
+    _, _, headers, is_remote = resolve_comfyui_connection(base_url=base_url, mode=status.get("mode"))
     preset_id = str(params.get("comfy_preset") or params.get("model_id") or "comfy_ltx25")
     prompt = str(params.get("prompt", "")).strip()
     neg_prompt = str(params.get("negative_prompt", "")).strip()
@@ -985,17 +1067,18 @@ async def run_comfyui_video(
     raw_seed = params.get("seed")
     seed = int(raw_seed) if (raw_seed is not None and str(raw_seed).strip() != "") else random.randint(1, 2147483647)
     detected = status["detected"]
+    node_prefix = "Colab ComfyUI" if is_remote else "ComfyUI"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0 if is_remote else 120.0, headers=headers, follow_redirects=True) as client:
         ff_name: Optional[str] = None
         lf_name: Optional[str] = None
         if first_frame_path and first_frame_path.exists():
             job["progress"] = 8
-            job["message"] = "正在上傳首幀圖片至 ComfyUI..."
+            job["message"] = f"正在上傳首幀圖片至 {node_prefix}..."
             ff_name = await _upload_image_to_comfyui(client, base_url, first_frame_path)
         if last_frame_path and last_frame_path.exists():
             job["progress"] = 10
-            job["message"] = "正在上傳尾幀圖片至 ComfyUI..."
+            job["message"] = f"正在上傳尾幀圖片至 {node_prefix}..."
             lf_name = await _upload_image_to_comfyui(client, base_url, last_frame_path)
 
         if is_cancelled():
@@ -1006,21 +1089,21 @@ async def run_comfyui_video(
             if not wf_id:
                 raise ValueError("請先從下拉選單選擇一個已安裝的 ComfyUI 工作流。")
             job["progress"] = 12
-            job["message"] = "正在載入並轉換 ComfyUI 影片工作流..."
-            raw_wf, wf_name = await fetch_comfyui_workflow_raw(base_url, wf_id)
+            job["message"] = f"正在載入並轉換 {node_prefix} 影片工作流..."
+            raw_wf, wf_name = await fetch_comfyui_workflow_raw(base_url, wf_id, headers=headers)
             workflow = await _prepare_loaded_or_custom_workflow(
-                base_url, raw_wf, prompt, neg_prompt, width, height, 1, steps, seed, ff_name, lf_name
+                base_url, raw_wf, prompt, neg_prompt, width, height, 1, steps, seed, ff_name, lf_name, headers=headers
             )
-            model_meta = {"id": f"comfy_wf:{wf_id}", "name": f"ComfyUI 工作流 · {wf_name}", "quantization": "Workflow"}
+            model_meta = {"id": f"comfy_wf:{wf_id}", "name": f"{node_prefix} 工作流 · {wf_name}", "quantization": "Colab" if is_remote else "Workflow"}
         elif preset_id == "comfy_custom_json":
             custom_json = str(params.get("comfy_workflow_json") or "").strip()
             if not custom_json:
                 raise ValueError("請先上傳或貼上 ComfyUI JSON 工作流檔案。")
             raw_wf = json.loads(custom_json)
             workflow = await _prepare_loaded_or_custom_workflow(
-                base_url, raw_wf, prompt, neg_prompt, width, height, 1, steps, seed, ff_name, lf_name
+                base_url, raw_wf, prompt, neg_prompt, width, height, 1, steps, seed, ff_name, lf_name, headers=headers
             )
-            model_meta = {"id": "comfy_custom_json", "name": "ComfyUI 自訂工作流", "quantization": "JSON"}
+            model_meta = {"id": "comfy_custom_json", "name": f"{node_prefix} 自訂工作流", "quantization": "Colab" if is_remote else "JSON"}
         elif preset_id == "comfy_ltx25":
             if not detected.get("has_ltx25"):
                 raise RuntimeError("ComfyUI 尚未安裝完整 LTX-2.5 權重（需要 UNET + Gemma4 CLIP + Video/Audio VAE + x2 Upscaler）。")

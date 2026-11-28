@@ -193,6 +193,9 @@ export interface AppSettings {
   external_api_model: string;
   sd_cli_path: string;
   comfyui_url: string;
+  comfyui_mode: 'local' | 'remote';
+  comfyui_remote_url: string;
+  comfyui_remote_token: string;
   custom_image_api: string;
   image_backend: 'comfyui' | 'sd_cli' | 'custom_api';
   video_backend: 'comfyui' | 'jimeng' | 'sd_cli';
@@ -269,6 +272,8 @@ export interface ComfyUIWorkflowSummary {
 
 export interface ComfyUIStatus {
   online: boolean;
+  mode?: 'local' | 'remote';
+  is_remote?: boolean;
   url: string;
   version: string;
   gpu_name: string;
@@ -312,6 +317,9 @@ export interface MediaModelsResponse {
       error: string;
     };
     comfyui_url: string;
+    comfyui_mode?: 'local' | 'remote';
+    comfyui_remote_url?: string;
+    comfyui_remote_has_token?: boolean;
     custom_image_api: string;
     image_backend?: 'comfyui' | 'sd_cli' | 'custom_api';
     video_backend?: 'comfyui' | 'jimeng' | 'sd_cli';

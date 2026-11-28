@@ -71,6 +71,9 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
   // Image Backend: comfyui (default) | sd_cli
   const [imageBackend, setImageBackend] = useState<'comfyui' | 'sd_cli'>('comfyui');
   const backendInitRef = useRef(false);
+  const [comfyMode, setComfyMode] = useState<'local' | 'remote'>('local');
+  const [colabUrlDraft, setColabUrlDraft] = useState('');
+  const [switchingNode, setSwitchingNode] = useState(false);
   const [comfyPreset, setComfyPreset] = useState('comfy_z_image_turbo');
   const [comfyCheckpoint, setComfyCheckpoint] = useState('');
   const [comfyWorkflowId, setComfyWorkflowId] = useState('');
@@ -134,6 +137,8 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
         backendInitRef.current = true;
         if (m.engines.image_backend === 'sd_cli') setImageBackend('sd_cli');
         else setImageBackend('comfyui');
+        if (m.engines.comfyui_mode) setComfyMode(m.engines.comfyui_mode);
+        if (m.engines.comfyui_remote_url) setColabUrlDraft(m.engines.comfyui_remote_url);
       }
 
       const imgPresets = m.comfyui_status?.image_presets || [];
@@ -174,6 +179,26 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
       setNotice(`檢測 ComfyUI 失敗：${err.message}`);
     } finally {
       setProbingComfy(false);
+    }
+  };
+
+  const handleSwitchComfyNode = async (nextMode: 'local' | 'remote', overrideUrl?: string) => {
+    setComfyMode(nextMode);
+    setSwitchingNode(true);
+    setNotice('');
+    try {
+      const res = await api.switchComfyuiMode({
+        mode: nextMode,
+        remote_url: nextMode === 'remote' ? (overrideUrl ?? colabUrlDraft) : undefined,
+      });
+      await loadAll();
+      if (!res.status.online && nextMode === 'remote' && (overrideUrl ?? colabUrlDraft).trim()) {
+        setNotice(`無法連上 Colab ComfyUI：${res.status.error || '請確認 Colab 步驟 4 正在執行且網址正確'}`);
+      }
+    } catch (err: any) {
+      setNotice(`切換 ComfyUI 節點失敗：${err.message}`);
+    } finally {
+      setSwitchingNode(false);
     }
   };
 
@@ -238,6 +263,7 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
     try {
       await api.generateImage({
         image_backend: imageBackend,
+        comfyui_mode: comfyMode,
         comfy_preset: comfyPreset,
         comfy_checkpoint: comfyCheckpoint,
         comfy_workflow_id: comfyPreset === 'comfy_saved_workflow' ? comfyWorkflowId : undefined,
@@ -374,8 +400,10 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
                 }`}
               />
               {comfyOnline
-                ? `ComfyUI 已連線 · ${imageWorkflows.length} 工作流`
-                : 'ComfyUI 未連線'}
+                ? `${mediaInfo?.comfyui_status?.is_remote ? 'Colab' : '本機'} ComfyUI 已連線 · ${imageWorkflows.length} 工作流`
+                : comfyMode === 'remote'
+                  ? 'Colab ComfyUI 未連線'
+                  : '本機 ComfyUI 未連線'}
               <RefreshCw className={`w-3 h-3 ${probingComfy ? 'animate-spin' : ''}`} />
             </button>
 
@@ -431,6 +459,59 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
         {/* Model / ComfyUI Pipeline & Auto-Loaded Workflow Row */}
         {imageBackend === 'comfyui' ? (
           <div className="space-y-2.5">
+            {/* Quick Local / Colab Pro ComfyUI Node Switcher */}
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <div className="flex items-center bg-paper p-0.5 rounded-xl border border-paper-border gap-0.5">
+                <button
+                  type="button"
+                  disabled={switchingNode}
+                  onClick={() => handleSwitchComfyNode('local')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${
+                    comfyMode === 'local'
+                      ? 'bg-cyan-500/20 text-cyan-200 border border-cyan-400/50'
+                      : 'text-slateink-muted hover:text-slateink'
+                  }`}
+                >
+                  本機 GPU
+                </button>
+                <button
+                  type="button"
+                  disabled={switchingNode}
+                  onClick={() => handleSwitchComfyNode('remote')}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold transition ${
+                    comfyMode === 'remote'
+                      ? 'bg-indigo-500/25 text-indigo-200 border border-indigo-400/50'
+                      : 'text-slateink-muted hover:text-slateink'
+                  }`}
+                >
+                  雲端 Colab Pro
+                </button>
+              </div>
+              {comfyMode === 'remote' && (
+                <div className="flex flex-1 min-w-[260px] max-w-md gap-1.5">
+                  <input
+                    value={colabUrlDraft}
+                    onChange={(e) => setColabUrlDraft(e.target.value)}
+                    placeholder="貼上 Colab 網址 https://xxxx.trycloudflare.com"
+                    className="flex-1 px-3 py-1 rounded-xl bg-paper border border-indigo-500/40 text-[11px] font-mono text-slateink focus:outline-none focus:border-indigo-400"
+                  />
+                  <button
+                    type="button"
+                    disabled={switchingNode || !colabUrlDraft.trim()}
+                    onClick={() => handleSwitchComfyNode('remote', colabUrlDraft)}
+                    className="px-3 py-1 rounded-xl bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-semibold disabled:opacity-45"
+                  >
+                    {switchingNode ? '連線中' : '連線'}
+                  </button>
+                </div>
+              )}
+              {comfyOnline && mediaInfo?.comfyui_status?.gpu_name && (
+                <span className="text-[11px] font-mono text-emerald-300/85 truncate">
+                  {mediaInfo.comfyui_status.gpu_name}
+                </span>
+              )}
+            </div>
+
             <div className="grid grid-cols-1 md:grid-cols-12 gap-2.5 items-center">
               <div className="md:col-span-5">
                 <select
@@ -915,7 +996,7 @@ export const ImagePage: React.FC<ImagePageProps> = ({ onNavigate, onSendToVideo 
       </div>
 
       {/* VRAM Conflict Guard Banner */}
-      {mediaInfo?.engines.llm_running && (
+      {mediaInfo?.engines.llm_running && !(imageBackend === 'comfyui' && comfyMode === 'remote') && (
         <div className="rounded-xl bg-amber-500/12 border border-amber-500/40 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
           <div>
             <strong>顯存衝突提醒：</strong>背景的本地語言模型（

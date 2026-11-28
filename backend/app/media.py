@@ -216,7 +216,10 @@ class MediaManager:
         data = self.get_media_models()
         comfy_status = await probe_comfyui()
         data["comfyui_status"] = comfy_status
-        data["engines"]["comfyui_url"] = comfy_status.get("url") or config_manager.config.comfyui_url
+        data["engines"]["comfyui_url"] = config_manager.config.comfyui_url
+        data["engines"]["comfyui_mode"] = config_manager.config.comfyui_mode
+        data["engines"]["comfyui_remote_url"] = config_manager.config.comfyui_remote_url
+        data["engines"]["comfyui_remote_has_token"] = bool(config_manager.config.comfyui_remote_token.strip())
         data["engines"]["image_backend"] = config_manager.config.image_backend
         data["engines"]["video_backend"] = config_manager.config.video_backend
         data["engines"]["jimeng_configured"] = bool(config_manager.config.jimeng_api_key.strip())
@@ -420,9 +423,11 @@ class MediaManager:
         t0 = time.monotonic()
         try:
             image_backend = str(params.get("image_backend") or config_manager.config.image_backend or "comfyui").lower()
+            comfy_mode = str(params.get("comfyui_mode") or config_manager.config.comfyui_mode or "local").lower()
+            uses_local_gpu = image_backend == "sd_cli" or (image_backend == "comfyui" and comfy_mode != "remote")
             custom_api = config_manager.config.custom_image_api.strip()
 
-            if image_backend != "custom_api" and params.get("auto_unload_llm", True) and (
+            if uses_local_gpu and params.get("auto_unload_llm", True) and (
                 engine_manager.status in ("running", "starting")
                 or engine_manager.find_external_llama_servers()
             ):
@@ -625,7 +630,10 @@ class MediaManager:
                 job["message"] = f"即夢 API 影片生成完成（耗時 {job['elapsed_seconds']}s）"
                 return
 
-            if params.get("auto_unload_llm", True) and (
+            comfy_mode = str(params.get("comfyui_mode") or config_manager.config.comfyui_mode or "local").lower()
+            uses_local_gpu = backend == "sd_cli" or (backend == "comfyui" and comfy_mode != "remote")
+
+            if uses_local_gpu and params.get("auto_unload_llm", True) and (
                 engine_manager.status in ("running", "starting")
                 or engine_manager.find_external_llama_servers()
             ):

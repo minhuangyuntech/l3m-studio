@@ -46,7 +46,12 @@ _IMAGE_NODE_HINTS = (
 )
 
 
-async def get_comfy_object_info(base_url: str, force: bool = False) -> Dict[str, Any]:
+async def get_comfy_object_info(
+    base_url: str,
+    force: bool = False,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 20.0,
+) -> Dict[str, Any]:
     url = base_url.strip().rstrip("/")
     now = time.monotonic()
     if (
@@ -56,7 +61,7 @@ async def get_comfy_object_info(base_url: str, force: bool = False) -> Dict[str,
         and (now - _OBJ_INFO_CACHE["ts"]) < 60.0
     ):
         return _OBJ_INFO_CACHE["data"]
-    async with httpx.AsyncClient(timeout=20.0) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=headers or {}) as client:
         r = await client.get(f"{url}/object_info")
         r.raise_for_status()
         data = r.json()
@@ -106,6 +111,8 @@ async def list_comfyui_workflows(
     base_url: str,
     installed_files: Optional[Set[str]] = None,
     force: bool = False,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 12.0,
 ) -> List[Dict[str, Any]]:
     """Auto-discover user-saved workflows, custom-node workflows, and installed ComfyUI templates."""
     url = base_url.strip().rstrip("/")
@@ -121,7 +128,7 @@ async def list_comfyui_workflows(
     workflows: List[Dict[str, Any]] = []
     installed_low = {f.lower().replace("\\", "/").split("/")[-1] for f in (installed_files or set())}
 
-    async with httpx.AsyncClient(timeout=8.0) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=headers or {}) as client:
         # 1. User-saved workflows via /api/v2/userdata?path=workflows (recursive)
         async def _scan_userdata(rel_path: str) -> None:
             try:
@@ -279,10 +286,15 @@ async def list_comfyui_workflows(
     return workflows
 
 
-async def fetch_comfyui_workflow_raw(base_url: str, workflow_id: str) -> Tuple[Dict[str, Any], str]:
+async def fetch_comfyui_workflow_raw(
+    base_url: str,
+    workflow_id: str,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float = 20.0,
+) -> Tuple[Dict[str, Any], str]:
     """Fetch the raw JSON dict and display name for an auto-loaded ComfyUI workflow."""
     url = base_url.strip().rstrip("/")
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=headers or {}) as client:
         if workflow_id.startswith("user:"):
             epath = workflow_id[5:]
             encoded = urllib.parse.quote(epath, safe="")
