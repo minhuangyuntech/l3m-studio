@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,13 +32,19 @@ from .scheduler import scheduler_manager
 from .tiering import plan_auto_tiering
 
 router = APIRouter(prefix="/api")
+SERVER_STARTED_AT = time.time()
 
 
 # ---------- Health & Hardware ----------
 
 @router.get("/health")
 async def health() -> Dict[str, Any]:
-    return {"status": "ok", "app": "L3M Studio", "version": "1.1.0"}
+    return {
+        "status": "ok",
+        "app": "L3M Studio",
+        "version": "1.2.0",
+        "started_at": SERVER_STARTED_AT,
+    }
 
 
 @router.get("/hardware")

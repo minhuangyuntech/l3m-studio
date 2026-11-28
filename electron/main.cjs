@@ -1,13 +1,29 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const http = require('http');
 const net = require('net');
 const path = require('path');
 const fs = require('fs');
 
 const DEFAULT_PORT = Number(process.env.LOCMODEL_BACKEND_PORT || 18765);
-const EXPECTED_VERSION = '1.1.0';
+const EXPECTED_VERSION = '1.2.0';
 const IS_DEV = process.env.LOCMODEL_DEV === '1';
+
+function getLatestBackendMtimeSec() {
+  const appDir = path.resolve(__dirname, '..', 'backend', 'app');
+  let latest = 0;
+  try {
+    for (const f of fs.readdirSync(appDir)) {
+      if (f.endsWith('.py')) {
+        const st = fs.statSync(path.join(appDir, f));
+        if (st.mtimeMs / 1000 > latest) latest = st.mtimeMs / 1000;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return latest;
+}
 
 let activePort = DEFAULT_PORT;
 let mainWindow = null;
@@ -173,12 +189,15 @@ ipcMain.handle('window:toggleFullscreen', async () => {
 
 app.whenReady().then(async () => {
   const existing = await probeHealth(DEFAULT_PORT);
+  const latestPyMtime = getLatestBackendMtimeSec();
   if (
     existing &&
     existing.statusCode === 200 &&
     existing.data &&
     existing.data.app === 'L3M Studio' &&
-    existing.data.version === EXPECTED_VERSION
+    existing.data.version === EXPECTED_VERSION &&
+    typeof existing.data.started_at === 'number' &&
+    existing.data.started_at >= latestPyMtime
   ) {
     activePort = DEFAULT_PORT;
   } else {
@@ -200,11 +219,19 @@ app.whenReady().then(async () => {
 });
 
 app.on('before-quit', () => {
-  if (backendProc) {
+  if (backendProc && backendProc.pid) {
     try {
-      backendProc.kill();
+      if (process.platform === 'win32') {
+        execSync(`taskkill /F /T /PID ${backendProc.pid}`, { stdio: 'ignore', windowsHide: true });
+      } else {
+        backendProc.kill();
+      }
     } catch {
-      // ignore
+      try {
+        backendProc.kill();
+      } catch {
+        // ignore
+      }
     }
   }
 });
